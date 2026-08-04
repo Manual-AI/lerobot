@@ -206,6 +206,43 @@ def homogeneous_to_xyz_rot6d(transform: np.ndarray) -> np.ndarray:
     return np.concatenate([transform[:3, 3], transform[:2, :3].reshape(-1)], axis=0)
 
 
+def invert_homogeneous(transform: np.ndarray) -> np.ndarray:
+    """Inverse of a rigid transform, using ``R^-1 == R.T`` instead of a general solve.
+
+    Valid because every matrix built by :func:`xyz_rot6d_to_homogeneous` is orthonormal by
+    construction: :func:`rot6d_to_matrix` re-orthonormalises its input.
+    """
+    rotation = transform[:3, :3]
+    inverse = np.eye(4, dtype=np.float64)
+    inverse[:3, :3] = rotation.T
+    inverse[:3, 3] = -rotation.T @ transform[:3, 3]
+    return inverse
+
+
+def absolute_eef_to_relative(action: np.ndarray, reference_state: np.ndarray) -> np.ndarray:
+    """Convert absolute EEF poses in xyz+rot6d format to relative EEF deltas.
+
+    The exact inverse of :func:`relative_eef_to_absolute`: with ``T_ref`` built from
+    ``reference_state`` and ``T_abs`` from each timestep of ``action``, this returns
+    ``T_ref^-1 @ T_abs`` re-encoded as xyz+rot6d. Rotation is therefore composed as a genuine
+    SO(3) operation, and translation comes out expressed in the reference frame — unlike an
+    elementwise subtraction of two rot6d encodings, which does not correspond to any rotational
+    difference.
+
+    Args:
+        action: ``(B, T, 9)`` absolute EEF poses.
+        reference_state: ``(B, 9)`` reference EEF pose, broadcast across the horizon.
+    """
+
+    out = np.empty_like(action, dtype=np.float64)
+    for batch_idx in range(action.shape[0]):
+        reference_inv = invert_homogeneous(xyz_rot6d_to_homogeneous(reference_state[batch_idx]))
+        for timestep in range(action.shape[1]):
+            absolute = xyz_rot6d_to_homogeneous(action[batch_idx, timestep])
+            out[batch_idx, timestep] = homogeneous_to_xyz_rot6d(reference_inv @ absolute)
+    return out.astype(np.float32)
+
+
 def relative_eef_to_absolute(action: np.ndarray, reference_state: np.ndarray) -> np.ndarray:
     """Convert relative EEF deltas in xyz+rot6d format to absolute EEF poses."""
 
