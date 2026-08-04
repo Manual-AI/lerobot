@@ -353,6 +353,18 @@ class GrootConfig(PreTrainedConfig):
     # `type: NON_EEF` and subtracted elementwise, which is correct for joint angles.
     relative_eef_groups: list[str] = field(default_factory=list)
 
+    # Shifts the sampled action window forward by this many frames: the chunk becomes the actions at
+    # t+offset .. t+offset+chunk_size-1 while the observation (and hence a relative chunk's
+    # reference state) stays at t.
+    #
+    # The default 0 is right for teleoperated datasets, where action[t] is a commanded target that
+    # genuinely differs from the observed state[t]. It is degenerate for datasets recorded from a
+    # device that has no separate commanded signal -- a motion-capture glove or an exoskeleton, where
+    # action[t] IS state[t] by construction. There, chunk step 0 trains the policy to predict "stay
+    # exactly where you are", and under use_relative_actions that step is identically zero. Setting
+    # this to 1 makes every chunk step a real motion.
+    action_delta_offset: int = 0
+
     # Training parameters
     optimizer_lr: float = 1e-4
     # Isaac-GR00T N1.7 fine-tunes with AdamW betas (0.9, 0.999).
@@ -471,6 +483,12 @@ class GrootConfig(PreTrainedConfig):
                 f"n_action_steps ({self.n_action_steps}) cannot exceed chunk_size ({self.chunk_size})"
             )
 
+        if self.action_delta_offset < 0:
+            raise ValueError(
+                f"action_delta_offset ({self.action_delta_offset}) cannot be negative: the action "
+                "chunk cannot start before the observation it is conditioned on."
+            )
+
     def validate_features(self) -> None:
         """Validate and set up input/output features for Groot."""
         if self.input_features is None or self.output_features is None:
@@ -545,16 +563,23 @@ class GrootConfig(PreTrainedConfig):
 
     @property
     def action_delta_indices(self) -> list[int]:
-        """Return indices for delta actions."""
+        """Return indices for delta actions, shifted by ``action_delta_offset``."""
         model_action_horizon = (
             infer_groot_n1_7_action_horizon(self.base_model_path, self.embodiment_tag) or 40
         )
-        return list(range(min(self.chunk_size, model_action_horizon)))
+        horizon = min(self.chunk_size, model_action_horizon)
+        return list(range(self.action_delta_offset, self.action_delta_offset + horizon))
 
     @property
     def drop_n_last_frames(self) -> int:
-        """Exclude episode tails that cannot supply a complete N1.7 action chunk."""
-        return max(0, len(self.action_delta_indices) - 1)
+        """Exclude episode tails that cannot supply a complete N1.7 action chunk.
+
+        Keyed off the largest delta index rather than the count, so an offset window drops the
+        right number of tail frames instead of running off the end and being silently padded.
+        Identical to the previous ``len - 1`` when ``action_delta_offset`` is 0.
+        """
+        indices = self.action_delta_indices
+        return max(0, max(indices)) if indices else 0
 
     @property
     def reward_delta_indices(self) -> None:
