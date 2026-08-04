@@ -338,6 +338,21 @@ class GrootConfig(PreTrainedConfig):
     # keep the gripper absolute, matching the Isaac-GR00T single-arm + absolute-gripper convention.
     relative_exclude_joints: list[str] = field(default_factory=list)
 
+    # relative_eef_groups names the action dimensions that form end-effector POSES rather than
+    # independent scalars, so their relative form is a full SE(3) composition (T_ref^-1 @ T_t)
+    # instead of an elementwise subtraction. Matching follows relative_exclude_joints: each token is
+    # matched substring/case-insensitively against the dataset action feature names, and every
+    # contiguous run of names matching one token becomes a single `type: EEF` group.
+    #
+    # Each group must be exactly 9 dimensions, laid out as xyz + rot6d (`format: XYZ_ROT6D`) --
+    # the encoding the pretrained `*_relative_eef` embodiments use. A relative rot6d delta is
+    # meaningless under subtraction, so without this every rotation dimension of a relative-action
+    # run is trained on a numerically well-formed but geometrically invalid target.
+    #
+    # Empty default preserves the previous behaviour: every relative dimension is treated as
+    # `type: NON_EEF` and subtracted elementwise, which is correct for joint angles.
+    relative_eef_groups: list[str] = field(default_factory=list)
+
     # Training parameters
     optimizer_lr: float = 1e-4
     # Isaac-GR00T N1.7 fine-tunes with AdamW betas (0.9, 0.999).

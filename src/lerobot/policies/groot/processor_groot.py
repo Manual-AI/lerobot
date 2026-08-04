@@ -152,11 +152,18 @@ class _GrootN17CheckpointProcessorAssets:
     letter_box_transform: bool
 
 
+# An `xyz+rot6d` end-effector pose: 3 translation values plus the first two rows of the rotation
+# matrix. The only EEF format with compose/decompose helpers (see policies/groot/utils.py).
+N1_7_EEF_XYZ_ROT6D_DIM = 9
+
+
 @dataclass(frozen=True)
 class _GrootN17ActionGroup:
     key: str
     indices: list[int]
     relative: bool
+    # An end-effector pose group: relative form composes in SE(3) rather than subtracting.
+    eef: bool = False
 
 
 def _load_n1_7_checkpoint_processor_assets(config: GrootConfig) -> _GrootN17CheckpointProcessorAssets | None:
@@ -721,6 +728,7 @@ def _make_relative_action_training_stats(
     *,
     exclude_joints: list[str] | None,
     action_names: list[str] | None,
+    groups: list[_GrootN17ActionGroup] | None = None,
     preserve_action_horizon: bool = True,
 ) -> dict[str, dict[str, Any]]:
     try:
@@ -757,11 +765,17 @@ def _make_relative_action_training_stats(
                     f"({action_batch.shape[0]} vs {state_batch.shape[0]})."
                 )
 
-        relative_action = to_relative_actions(
-            action_batch,
-            state_batch,
-            relative_step._build_mask(action_batch.shape[-1]),
-        )
+        if groups:
+            # Group-aware: EEF groups compose in SE(3), NON_EEF groups subtract. Without this the
+            # stats would describe an elementwise "delta" that training never produces for EEF
+            # groups, so those dimensions would be normalized against the wrong distribution.
+            relative_action = _convert_action_batch_to_relative(action_batch, state_batch, groups)
+        else:
+            relative_action = to_relative_actions(
+                action_batch,
+                state_batch,
+                relative_step._build_mask(action_batch.shape[-1]),
+            )
         if not preserve_action_horizon:
             relative_action = relative_action.reshape(-1, relative_action.shape[-1]).unsqueeze(0)
             pad_mask = None
@@ -832,10 +846,20 @@ def _make_relative_action_training_stats_from_dataset_meta(
         download_videos=False,
         return_uint8=True,
     )
+    action_names = _resolve_action_feature_names_from_dataset_meta(dataset_meta)
+    # Same grouping the pack step will use at training time, so the statistics and the conversion
+    # agree by construction. Falls back to the flat mask when the dataset declares no action names.
+    groups = _infer_n1_7_action_groups(
+        action_names or [],
+        action_dim=len(action_names or []),
+        exclude_joints=list(config.relative_exclude_joints or []),
+        eef_groups=list(config.relative_eef_groups or []),
+    )
     return _make_relative_action_training_stats(
         dataset,
         exclude_joints=list(config.relative_exclude_joints or []),
-        action_names=_resolve_action_feature_names_from_dataset_meta(dataset_meta),
+        action_names=action_names,
+        groups=groups,
         preserve_action_horizon=True,
     )
 
@@ -876,19 +900,37 @@ def _feature_group_key(name: str) -> str:
     return base.replace(" ", "_") or "action"
 
 
+def _matching_token(lowered_name: str, tokens: list[str]) -> str | None:
+    """First token equal to, or contained in, ``lowered_name``. Mirrors the exclude-joint rule."""
+    for token in tokens:
+        if token == lowered_name or token in lowered_name:
+            return token
+    return None
+
+
 def _infer_n1_7_action_groups(
     action_names: list[str],
     *,
     action_dim: int,
     exclude_joints: list[str],
+    eef_groups: list[str] | None = None,
 ) -> list[_GrootN17ActionGroup]:
+    """Split the flat action vector into N1.7 modality groups, in index order.
+
+    Groups are emitted in layout order because every consumer walks them with a running offset.
+    Names matching an ``eef_groups`` token form contiguous `type: EEF` pose groups; excluded names
+    become single-dimension absolute groups; everything else accumulates into relative runs.
+    """
     if not action_names or action_dim <= 0:
         return []
 
     names = list(action_names[:action_dim])
     exclude_tokens = [str(token).lower() for token in exclude_joints if token]
+    eef_tokens = [str(token).lower() for token in (eef_groups or []) if token]
     groups: list[_GrootN17ActionGroup] = []
     current_indices: list[int] = []
+    eef_indices: list[int] = []
+    eef_token: str | None = None
 
     def flush_relative_group() -> None:
         if not current_indices:
@@ -901,10 +943,46 @@ def _infer_n1_7_action_groups(
         groups.append(_GrootN17ActionGroup(key=key, indices=list(current_indices), relative=True))
         current_indices.clear()
 
+    def flush_eef_group() -> None:
+        nonlocal eef_token
+        if not eef_indices:
+            return
+        if len(eef_indices) != N1_7_EEF_XYZ_ROT6D_DIM:
+            raise ValueError(
+                f"relative_eef_groups token '{eef_token}' matched {len(eef_indices)} contiguous "
+                f"action dimensions ({[names[i] for i in eef_indices]}), but an XYZ_ROT6D "
+                f"end-effector pose is exactly {N1_7_EEF_XYZ_ROT6D_DIM} (xyz + rot6d). Narrow the "
+                "token so it matches one pose group."
+            )
+        # One token may match several contiguous runs (e.g. a single `_ee_` token on a bimanual
+        # rig). Keys index the raw_stats/modality_keys dicts, so a collision would silently drop a
+        # group; uniquify the same way the relative runs above do.
+        key = str(eef_token)
+        if any(group.key == key for group in groups):
+            key = f"{key}_{len(groups)}"
+        groups.append(_GrootN17ActionGroup(key=key, indices=list(eef_indices), relative=True, eef=True))
+        eef_indices.clear()
+        eef_token = None
+
     for index, name in enumerate(names):
         lowered = str(name).lower()
-        is_excluded = any(token == lowered or token in lowered for token in exclude_tokens)
-        if is_excluded:
+        matched_eef = _matching_token(lowered, eef_tokens)
+        if matched_eef is not None:
+            if _matching_token(lowered, exclude_tokens) is not None:
+                raise ValueError(
+                    f"Action dimension '{name}' matches both relative_eef_groups "
+                    f"('{matched_eef}') and relative_exclude_joints. A dimension cannot be both "
+                    "part of a relative end-effector pose and held absolute."
+                )
+            flush_relative_group()
+            if matched_eef != eef_token:
+                flush_eef_group()
+                eef_token = matched_eef
+            eef_indices.append(index)
+            continue
+
+        flush_eef_group()
+        if _matching_token(lowered, exclude_tokens) is not None:
             flush_relative_group()
             groups.append(
                 _GrootN17ActionGroup(key=_feature_group_key(str(name)), indices=[index], relative=False)
@@ -912,8 +990,39 @@ def _infer_n1_7_action_groups(
         else:
             current_indices.append(index)
 
+    flush_eef_group()
     flush_relative_group()
     return groups
+
+
+def _convert_action_batch_to_relative(
+    action: torch.Tensor,
+    state: torch.Tensor,
+    groups: list[_GrootN17ActionGroup],
+) -> torch.Tensor:
+    """Absolute -> relative for one ``(B, T, D)`` batch, group by group.
+
+    Deliberately mirrors ``GrootN17PackInputsStep._convert_relative_action_groups_for_training``:
+    the statistics computed from this must describe exactly the quantity training will produce,
+    or relative actions get normalized against the distribution of a different transform.
+    """
+    converted = action.clone()
+    for group in groups:
+        if not group.relative:
+            continue
+        indices = group.indices
+        reference = state[:, indices]
+        if group.eef:
+            relative = absolute_eef_to_relative(
+                converted[:, :, indices].detach().cpu().to(torch.float32).numpy(),
+                reference.detach().cpu().to(torch.float32).numpy(),
+            )
+            converted[:, :, indices] = torch.from_numpy(relative).to(
+                dtype=converted.dtype, device=converted.device
+            )
+        else:
+            converted[:, :, indices] -= reference[:, None, :]
+    return converted
 
 
 def _group_stats_by_action_groups(
@@ -976,6 +1085,7 @@ def _build_n1_7_relative_action_processor_assets(
         action_names,
         action_dim=action_dim,
         exclude_joints=list(config.relative_exclude_joints or []),
+        eef_groups=list(config.relative_eef_groups or []),
     )
     if not groups or not any(group.relative for group in groups):
         return None
@@ -1004,8 +1114,11 @@ def _build_n1_7_relative_action_processor_assets(
     action_configs = [
         {
             "rep": "RELATIVE" if group.relative else "ABSOLUTE",
-            "type": "NON_EEF",
-            "format": "DEFAULT",
+            "type": "EEF" if group.eef else "NON_EEF",
+            "format": "XYZ_ROT6D" if group.eef else "DEFAULT",
+            # Left None deliberately: both the training and decode paths resolve a missing
+            # state_key to the group's own key, and the state groups below are built from the same
+            # `groups`, so the reference is the state slice under the identical key.
             "state_key": None,
         }
         for group in groups
