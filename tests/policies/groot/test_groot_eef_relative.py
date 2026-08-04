@@ -48,9 +48,7 @@ def _random_pose(rng: np.random.Generator) -> np.ndarray:
 
 
 def _random_poses_xyz_rot6d(rng: np.random.Generator, count: int) -> np.ndarray:
-    return np.stack([homogeneous_to_xyz_rot6d(_random_pose(rng)) for _ in range(count)]).astype(
-        np.float32
-    )
+    return np.stack([homogeneous_to_xyz_rot6d(_random_pose(rng)) for _ in range(count)]).astype(np.float32)
 
 
 def test_absolute_to_relative_round_trips_for_arbitrary_rotation_pairs():
@@ -155,9 +153,7 @@ def test_batch_and_horizon_shapes_are_preserved(horizon):
 
     assert relative.shape == (batch, horizon, 9)
     assert relative.dtype == np.float32
-    np.testing.assert_allclose(
-        relative_eef_to_absolute(relative, reference), absolute, atol=1e-5
-    )
+    np.testing.assert_allclose(relative_eef_to_absolute(relative, reference), absolute, atol=1e-5)
 
 
 def test_each_batch_element_uses_its_own_reference():
@@ -177,9 +173,7 @@ def test_invert_homogeneous_matches_a_general_inverse():
     rng = np.random.default_rng(6)
     for _ in range(16):
         transform = _random_pose(rng)
-        np.testing.assert_allclose(
-            invert_homogeneous(transform), np.linalg.inv(transform), atol=1e-9
-        )
+        np.testing.assert_allclose(invert_homogeneous(transform), np.linalg.inv(transform), atol=1e-9)
 
 
 def test_conversion_tolerates_non_orthonormal_rot6d_input():

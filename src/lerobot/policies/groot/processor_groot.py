@@ -86,6 +86,7 @@ from .configuration_groot import (
     is_raw_groot_n1_7_checkpoint,
 )
 from .utils import (
+    absolute_eef_to_relative,
     as_int_pair,
     as_optional_float,
     as_optional_int,
@@ -1643,8 +1644,7 @@ class GrootN17PackInputsStep(ProcessorStep):
             )
             if config_value(cfg.get("rep")) == "relative":
                 action_type = config_value(cfg.get("type"))
-                if action_type != "non_eef":
-                    raise ValueError(f"Unsupported relative N1.7 action config for '{key}': {cfg}")
+                action_format = config_value(cfg.get("format"))
                 state_key = cfg.get("state_key") or key
                 reference = state_groups.get(state_key)
                 if reference is None:
@@ -1657,7 +1657,27 @@ class GrootN17PackInputsStep(ProcessorStep):
                 if not cloned:
                     converted = action.clone()
                     cloned = True
-                converted[..., start_idx:end_idx] -= reference[:, None, :]
+                if action_type == "non_eef":
+                    converted[..., start_idx:end_idx] -= reference[:, None, :]
+                elif action_type == "eef" and action_format == "xyz+rot6d":
+                    # Mirror of the decode path's EEF branch (see GrootN17ActionDecodeStep):
+                    # T_ref^-1 @ T_abs, so rotation composes in SO(3) and translation ends up in
+                    # the reference frame. Elementwise subtraction would be meaningless on rot6d.
+                    #
+                    # Reuses the same numpy helper the decode side uses rather than adding a
+                    # second, tensor-native implementation of the same maths -- the two directions
+                    # must stay exact inverses. This step runs before DeviceProcessorStep, so the
+                    # tensors are on CPU and the conversion costs no device sync; the per-sample
+                    # loop is negligible next to the model forward.
+                    relative = absolute_eef_to_relative(
+                        converted[..., start_idx:end_idx].detach().cpu().to(torch.float32).numpy(),
+                        reference.detach().cpu().to(torch.float32).numpy(),
+                    )
+                    converted[..., start_idx:end_idx] = torch.from_numpy(relative).to(
+                        dtype=converted.dtype, device=converted.device
+                    )
+                else:
+                    raise ValueError(f"Unsupported relative N1.7 action config for '{key}': {cfg}")
 
             start_idx = end_idx
 
