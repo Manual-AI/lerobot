@@ -869,7 +869,17 @@ def _make_relative_action_training_stats_from_dataset_meta(
     # Relative stats are computed per chunk timestep at the native N1.7 horizon, so the
     # stats dataset must yield native-length action windows even when config.chunk_size
     # executes fewer steps.
-    delta_timestamps = {ACTION: [index / fps for index in range(N1_7_NATIVE_ACTION_HORIZON)]}
+    #
+    # The window MUST start at the same offset training samples from. Both the training
+    # normalizer and the decode step index these stats by chunk step (`min_t[:horizon]`), so row
+    # k is applied to chunk step k. Chunk step k holds delta index `action_delta_offset + k`, so
+    # a window hardcoded to start at 0 would silently pair step k with row k's distribution while
+    # its true content is row k+offset's -- a horizon misalignment that survives into the saved
+    # checkpoint. It self-cancels between train and inference (both slice the same rows), but the
+    # scale is wrong for the data, so large deltas clip to +-1 during training and decode back
+    # under-shot. Offsetting the window here keeps row k == step k by construction.
+    offset = int(getattr(config, "action_delta_offset", 0) or 0)
+    delta_timestamps = {ACTION: [(offset + index) / fps for index in range(N1_7_NATIVE_ACTION_HORIZON)]}
     dataset = LeRobotDataset(
         repo_id,
         root=root,
