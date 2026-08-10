@@ -222,6 +222,40 @@ uv run lerobot-rollout \
 > [!NOTE]
 > Value of `inference.queue_threshold` should not exceed 5 to ensure stable inference.
 
+#### RTC with relative actions
+
+Checkpoints fine-tuned with `--policy.use_relative_actions=true` predict actions as deltas
+against the observation they were predicted from, normalized with one statistics row per chunk
+step. The RTC engine therefore cannot reuse the previous chunk's model-space output as the
+overlap prefix: those rows are anchored to the previous observation and to the previous chunk's
+step indices. Instead it takes the unexecuted tail in absolute coordinates, re-expresses it
+against the current observation (an SE(3) delta for end-effector groups, an elementwise offset
+for the rest), and normalizes each row with the statistics row of its new chunk step. No extra
+flags are needed — this happens automatically for relative-action checkpoints under
+`--inference.type=rtc`.
+
+Every chunk swap is measured, so you can compare configurations rather than eyeball smoothness.
+At the end of each episode the rollout logs the commanded-action jump across chunk boundaries in
+raw action units:
+
+```
+RTC chunk seam continuity over 42 boundaries: max_abs mean=0.61 p95=1.40 max=2.10, l2 mean=0.93
+```
+
+Lower is smoother. To measure the effect of prefix guidance itself, run the same task twice with
+the same `execution_horizon` and fps and compare `max_abs mean`:
+
+```bash
+# with seam conditioning (default)
+--inference.type=rtc --inference.rtc.enabled=True --inference.rtc.prefix_guidance=true
+# same asynchronous chunk replacement, no seam conditioning
+--inference.type=rtc --inference.rtc.enabled=True --inference.rtc.prefix_guidance=false
+```
+
+`prefix_guidance=false` only removes the overlap conditioning; chunks are still produced ahead of
+time, so latency hiding — and therefore the arm's motion continuity between chunks — is otherwise
+unchanged and the two runs stay comparable.
+
 ## License
 
 GR00T N1.7 is released under the [NVIDIA Open Model License Agreement](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/).

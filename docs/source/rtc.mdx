@@ -109,7 +109,25 @@ RTCConfig(execution_horizon=10)
 - `ONES`: Full weight across entire execution_horizon
 - `ZEROS`: Binary (full weight up to inference_delay, then zero)
 
+**`prefix_guidance`**: Whether to condition each chunk on the previous chunk's unexecuted tail (default: `True`). Setting it to `False` keeps asynchronous chunk production — and therefore latency hiding — but drops the overlap conditioning. Use it as an ablation to measure how much the prefix actually smooths chunk boundaries.
+
 **`inference_delay`**: How many timesteps of inference latency your system has. This is passed to `predict_action_chunk()` rather than the config, since it may vary at runtime.
+
+## Measuring Chunk Continuity
+
+`lerobot-rollout` measures every chunk swap: it compares the action the outgoing chunk would have commanded next against the first action the incoming chunk actually commands, and logs the result in raw action units when the episode ends.
+
+```
+RTC chunk seam continuity over 42 boundaries: max_abs mean=0.61 p95=1.40 max=2.10, l2 mean=0.93
+```
+
+Lower is smoother. Compare configurations by running the same task and `execution_horizon` twice, once with `--inference.rtc.prefix_guidance=true` and once with `false`.
+
+## Relative-Action Policies
+
+Policies trained with relative actions predict deltas against the observation they were predicted from, so the previous chunk's model-space output cannot be reused verbatim as the prefix — it is anchored to the previous observation. The rollout engine therefore takes the unexecuted tail in absolute coordinates and re-expresses it against the current observation before handing it to the policy.
+
+GR00T N1.7 checkpoints with native relative action groups go one step further: their statistics have one row per chunk step, and end-effector groups compose as SE(3) transforms rather than elementwise offsets, so the checkpoint's own processor encodes the prefix (`GrootN17PackInputsStep.encode_absolute_rtc_prefix`). This is automatic; no flags are involved.
 
 ## Testing RTC Offline
 

@@ -515,7 +515,7 @@ def make_groot_pre_post_processors_from_pretrained(
         # lerobot-eval or the policy server) to the freshly built steps.
         _apply_groot_step_overrides(preprocessor, preprocessor_overrides)
         _apply_groot_step_overrides(postprocessor, postprocessor_overrides)
-        _apply_groot_action_decode_transform(postprocessor, config.action_decode_transform)
+        _apply_groot_action_decode_transform(preprocessor, postprocessor, config.action_decode_transform)
         return preprocessor, postprocessor
 
     preprocessor, postprocessor = _load_groot_processor_pipelines(
@@ -528,7 +528,7 @@ def make_groot_pre_post_processors_from_pretrained(
     )
     _reconnect_groot_relative_absolute_steps(preprocessor, postprocessor)
     _reconnect_groot_n1_7_pack_decode_steps(preprocessor, postprocessor)
-    _apply_groot_action_decode_transform(postprocessor, config.action_decode_transform)
+    _apply_groot_action_decode_transform(preprocessor, postprocessor, config.action_decode_transform)
     _set_groot_preprocessor_training(preprocessor, training=dataset_meta is not None)
     return preprocessor, postprocessor
 
@@ -606,6 +606,7 @@ def _reconnect_groot_n1_7_pack_decode_steps(
 
 
 def _apply_groot_action_decode_transform(
+    preprocessor: PolicyProcessorPipeline,
     postprocessor: PolicyProcessorPipeline,
     action_decode_transform: str | None,
 ) -> None:
@@ -618,6 +619,12 @@ def _apply_groot_action_decode_transform(
             step.libero_gripper_action = use_libero_transform
             if use_libero_transform:
                 step.libero_gripper_binarize = True
+
+    # The pack step re-anchors RTC prefixes out of postprocessed actions, so it needs to know
+    # when the decode transform standing between the two cannot be inverted.
+    for step in preprocessor.steps:
+        if isinstance(step, GrootN17PackInputsStep):
+            step.action_decode_transform = action_decode_transform
 
 
 def _resolve_feature_names_from_dataset_meta(dataset_meta: Any | None, feature_key: str) -> list[str] | None:
@@ -1354,6 +1361,7 @@ def make_groot_pre_post_processors(
         raw_stats=checkpoint_assets.raw_stats if checkpoint_assets is not None else None,
         use_percentiles=checkpoint_assets.use_percentiles if checkpoint_assets is not None else False,
         modality_config=checkpoint_assets.modality_config if checkpoint_assets is not None else None,
+        action_decode_transform=config.action_decode_transform,
     )
 
     # Resolve the image preprocessing geometry. Honor the checkpoint's processor_config
@@ -1681,8 +1689,16 @@ class GrootN17PackInputsStep(ProcessorStep):
     video_modality_keys: list[str] | None = None
     raw_stats: dict[str, Any] | None = None
     modality_config: dict[str, Any] | None = None
+    # Mirrors the postprocessor's decode transform so RTC prefix re-anchoring can refuse to
+    # invert a non-invertible one. Re-applied from the policy config on every build and load by
+    # `_apply_groot_action_decode_transform`, so it is deliberately not serialized.
+    action_decode_transform: str | None = field(default=None, repr=False)
     _last_raw_state: dict[str, np.ndarray] | None = field(default=None, init=False, repr=False)
+    _last_raw_state_tensor: torch.Tensor | None = field(default=None, init=False, repr=False)
     _warned_image_keys: bool = field(default=False, init=False, repr=False)
+    _warned_rtc_prefix_decode_transform: bool = field(default=False, init=False, repr=False)
+    _warned_rtc_prefix_horizon: bool = field(default=False, init=False, repr=False)
+    _warned_rtc_prefix_layout: bool = field(default=False, init=False, repr=False)
 
     def _ordered_image_keys(self, obs: dict[str, Any]) -> list[str]:
         available = {key for key in obs if key.startswith(OBS_IMAGES)}
@@ -1930,6 +1946,135 @@ class GrootN17PackInputsStep(ProcessorStep):
             isinstance(cfg, dict) and config_value(cfg.get("rep")) == "relative" for cfg in action_configs
         )
 
+    def _relative_stats_horizon(self) -> int | None:
+        """How many chunk steps the per-chunk-timestep relative stats can normalize.
+
+        ``None`` when no relative group carries 2D stats, i.e. nothing constrains the horizon.
+        """
+        if not isinstance(self.modality_config, dict) or not isinstance(self.raw_stats, dict):
+            return None
+        action_config = self.modality_config.get("action", {})
+        if not isinstance(action_config, dict):
+            return None
+        action_keys = action_config.get("modality_keys", [])
+        action_configs = action_config.get("action_configs", [])
+        if not isinstance(action_keys, list) or not isinstance(action_configs, list):
+            return None
+
+        rows: list[int] = []
+        for idx, key in enumerate(action_keys):
+            if not isinstance(key, str):
+                continue
+            cfg = (
+                action_configs[idx]
+                if idx < len(action_configs) and isinstance(action_configs[idx], dict)
+                else {}
+            )
+            if config_value(cfg.get("rep")) != "relative":
+                continue
+            min_v, _max_v = _n1_7_decode_stats_for_action(
+                self.raw_stats,
+                key,
+                cfg,
+                use_relative_action=True,
+                use_percentiles=self.use_percentiles,
+            )
+            if min_v.ndim == 2:
+                rows.append(int(min_v.shape[0]))
+        return min(rows) if rows else None
+
+    def uses_relative_rtc_prefix(self) -> bool:
+        """Whether this step owns RTC prefix encoding (see ``RelativeRTCPrefixEncoder``).
+
+        Native relative-action checkpoints express actions as deltas against the observation
+        they were predicted from, normalized per chunk step, so the RTC queue's model-space
+        leftovers carry a stale anchor and a stale stats row. The engine must hand the tail
+        back in absolute coordinates and let this step re-encode it.
+        """
+        return self._uses_relative_action_groups()
+
+    def encode_absolute_rtc_prefix(self, prev_actions_absolute: torch.Tensor) -> torch.Tensor | None:
+        """Re-anchor an absolute leftover tail into a native relative-action RTC prefix.
+
+        Row ``i`` of ``prev_actions_absolute`` is what the robot would execute ``i`` steps after
+        the observation this chunk is predicted from, which makes it chunk step ``i``. Feeding it
+        through the training conversion is therefore exactly right: the same SE(3) composition for
+        EEF groups and elementwise offset for NON_EEF ones against the currently cached state, and
+        the same ``relative_action`` row-``i``-for-step-``i`` normalization. Reusing those two
+        methods rather than repeating them is the point -- a prefix normalized on a different
+        scale than the model was trained on is the silent failure this path exists to avoid.
+
+        Returns ``None`` when no prefix can be built: no relative groups, no cached state yet, an
+        empty tail, a layout the grouped normalizer cannot handle, or a postprocessor whose
+        action decode transform is not invertible.
+        """
+        if not self._uses_relative_action_groups():
+            return None
+        if self.action_decode_transform is not None:
+            self._warn_rtc_prefix_once(
+                "_warned_rtc_prefix_decode_transform",
+                "Disabling native GR00T N1.7 relative-action RTC prefix guidance: action decode "
+                "transform '%s' is not invertible, so postprocessed leftovers cannot be "
+                "re-anchored into model space.",
+                self.action_decode_transform,
+            )
+            return None
+        state = self._last_raw_state_tensor
+        if state is None:
+            return None
+
+        prefix = prev_actions_absolute
+        if prefix.ndim == 2:
+            prefix = prefix.unsqueeze(0)
+        if prefix.ndim != 3:
+            raise ValueError(
+                "GR00T N1.7 RTC prefix must have shape (T, A) or (B, T, A), got "
+                f"{tuple(prev_actions_absolute.shape)}."
+            )
+        if prefix.shape[1] == 0 or prefix.shape[2] == 0:
+            return None
+        if prefix.shape[0] == 1 and state.shape[0] > 1:
+            prefix = prefix.expand(state.shape[0], -1, -1)
+        elif prefix.shape[0] != state.shape[0]:
+            raise ValueError(
+                f"GR00T N1.7 RTC prefix batch {prefix.shape[0]} does not match the cached state "
+                f"batch {state.shape[0]}."
+            )
+
+        horizon_limit = self._relative_stats_horizon()
+        if horizon_limit is not None and prefix.shape[1] > horizon_limit:
+            # Past the last stats row there is no correctly scaled normalization for the step, and
+            # reusing the last row is exactly the row/step misalignment this path avoids.
+            self._warn_rtc_prefix_once(
+                "_warned_rtc_prefix_horizon",
+                "Truncating the GR00T N1.7 relative-action RTC prefix from %d to %d steps: the "
+                "checkpoint relative_action stats only cover %d chunk steps.",
+                int(prefix.shape[1]),
+                horizon_limit,
+                horizon_limit,
+            )
+            prefix = prefix[:, :horizon_limit]
+
+        prefix = prefix.to(dtype=state.dtype, device=state.device)
+        relative = self._convert_relative_action_groups_for_training(prefix, state)
+        normalized = self._normalize_action_groups_for_training(relative)
+        if normalized is None:
+            self._warn_rtc_prefix_once(
+                "_warned_rtc_prefix_layout",
+                "Disabling native GR00T N1.7 relative-action RTC prefix guidance: grouped "
+                "normalization does not fit a prefix of shape %s. Running without overlap "
+                "guidance rather than scaling it wrongly.",
+                tuple(prefix.shape),
+            )
+            return None
+        return normalized.to(dtype=prev_actions_absolute.dtype, device=prev_actions_absolute.device)
+
+    def _warn_rtc_prefix_once(self, flag_name: str, message: str, *args: Any) -> None:
+        if getattr(self, flag_name, False):
+            return
+        setattr(self, flag_name, True)
+        logging.warning(message, *args)
+
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         obs = transition.get(TransitionKey.OBSERVATION, {}) or {}
         comp = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}) or {}
@@ -1991,6 +2136,10 @@ class GrootN17PackInputsStep(ProcessorStep):
                 start_idx += dim
             if grouped:
                 self._last_raw_state = grouped
+                # Also kept as a tensor: `encode_absolute_rtc_prefix` feeds the RTC prefix
+                # through `_convert_relative_action_groups_for_training`, which takes the
+                # unsplit state and groups it itself.
+                self._last_raw_state_tensor = state.detach().cpu().float()
 
         img_keys = self._ordered_image_keys(obs)
         if img_keys:

@@ -50,6 +50,7 @@ from lerobot.policies.groot.processor_groot import (
     _transform_n1_7_image_for_vlm_torch,
     make_groot_pre_post_processors,
 )
+from lerobot.policies.groot.utils import absolute_eef_to_relative
 from lerobot.processor import (
     AbsoluteActionsProcessorStep,
     PolicyProcessorPipeline,
@@ -1160,6 +1161,408 @@ def test_groot_policy_ignores_rtc_leftovers_for_relative_actions():
 
     assert output_inputs is inputs
     assert options is None
+
+
+def test_groot_policy_accepts_reanchored_rtc_prefix_for_relative_actions():
+    policy = object.__new__(GrootPolicy)
+    policy.config = SimpleNamespace(
+        use_relative_actions=True,
+        chunk_size=8,
+        max_action_dim=132,
+        rtc_config=SimpleNamespace(execution_horizon=4),
+    )
+    policy._groot_model = SimpleNamespace(config=SimpleNamespace(action_horizon=40, max_action_dim=132))
+    prefix = torch.arange(4 * 6, dtype=torch.float32).view(4, 6) + 1.0
+
+    output_inputs, options = policy._prepare_n1_7_rtc_inputs(
+        {"state": torch.zeros(1, 1, 132)},
+        inference_delay=1,
+        prev_chunk_left_over=prefix,
+        prev_chunk_left_over_reanchored=True,
+    )
+
+    assert options == {
+        "action_horizon": 4,
+        "rtc_overlap_steps": 4,
+        "rtc_frozen_steps": 1,
+        "rtc_ramp_rate": 6.0,
+    }
+    torch.testing.assert_close(output_inputs["action"][0, :, :6], prefix)
+
+
+# ---------------------------------------------------------------------------
+# Native relative-action RTC prefix re-anchoring
+# ---------------------------------------------------------------------------
+
+
+def _relative_rtc_pack_step(
+    *,
+    action_configs,
+    state_keys,
+    action_keys,
+    state_dims,
+    relative_stats,
+    absolute_stats,
+    horizon=3,
+    action_decode_transform=None,
+):
+    """Build a pack step whose checkpoint declares native relative action groups."""
+    action_dim = sum(state_dims[key] for key in action_keys)
+    return GrootN17PackInputsStep(
+        action_horizon=horizon,
+        valid_action_horizon=horizon,
+        max_state_dim=sum(state_dims[key] for key in state_keys),
+        max_action_dim=action_dim,
+        normalize_min_max=True,
+        clip_outliers=False,
+        action_decode_transform=action_decode_transform,
+        raw_stats={
+            "state": {
+                key: {"min": [0.0] * state_dims[key], "max": [1.0] * state_dims[key]} for key in state_keys
+            },
+            "action": {key: absolute_stats[key] for key in action_keys},
+            "relative_action": relative_stats,
+        },
+        modality_config={
+            "state": {"modality_keys": list(state_keys)},
+            "action": {
+                "modality_keys": list(action_keys),
+                "action_configs": action_configs,
+                "delta_indices": list(range(horizon)),
+            },
+        },
+    )
+
+
+def _cache_raw_state(step, state):
+    """Run the pack step on an observation so it caches the anchor state."""
+    step(
+        {
+            TransitionKey.OBSERVATION: {OBS_STATE: state},
+            TransitionKey.COMPLEMENTARY_DATA: {"task": ["Move"]},
+        }
+    )
+
+
+def _non_eef_prefix_pack_step(**kwargs):
+    return _relative_rtc_pack_step(
+        action_configs=[
+            {"rep": "RELATIVE", "type": "NON_EEF", "format": "DEFAULT", "state_key": None},
+            {"rep": "ABSOLUTE", "type": "NON_EEF", "format": "DEFAULT", "state_key": None},
+        ],
+        state_keys=["single_arm", "gripper"],
+        action_keys=["single_arm", "gripper"],
+        state_dims={"single_arm": 2, "gripper": 1},
+        relative_stats={
+            # One row per chunk step, with a deliberately different scale per row so a
+            # prefix normalized with the wrong row cannot pass by coincidence.
+            "single_arm": {
+                "min": [[-10.0, -10.0], [-20.0, -20.0], [-30.0, -30.0]],
+                "max": [[10.0, 10.0], [20.0, 20.0], [30.0, 30.0]],
+            }
+        },
+        absolute_stats={
+            "single_arm": {"min": [-100.0, -100.0], "max": [100.0, 100.0]},
+            "gripper": {"min": [0.0], "max": [100.0]},
+        },
+        **kwargs,
+    )
+
+
+def test_groot_n1_7_rtc_prefix_normalizes_each_step_with_its_new_horizon_stats_row():
+    step = _non_eef_prefix_pack_step()
+    _cache_raw_state(step, torch.tensor([[10.0, 20.0, 25.0]]))
+
+    # Each row offsets one joint by exactly that row's stats maximum, so a correctly
+    # aligned prefix normalizes to +1.0 on the diagonal.
+    prefix_absolute = torch.tensor(
+        [
+            [20.0, 20.0, 50.0],
+            [10.0, 40.0, 0.0],
+            [40.0, 20.0, 100.0],
+        ]
+    )
+
+    encoded = step.encode_absolute_rtc_prefix(prefix_absolute)
+
+    expected = torch.tensor(
+        [
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, -1.0],
+                [1.0, 0.0, 1.0],
+            ]
+        ]
+    )
+    torch.testing.assert_close(encoded, expected)
+
+
+def test_groot_n1_7_rtc_prefix_matches_what_training_would_produce():
+    """The prefix must land in the same space the model was trained on.
+
+    `action_delta_offset` makes stats row k describe chunk step k by construction (see
+    `_make_relative_action_training_stats_from_dataset_meta`), and the training normalizer
+    relies on that. An RTC prefix normalized any other way would be silently wrongly scaled, so
+    this pins the prefix to the training path's output for the same absolute chunk.
+    """
+    step = _non_eef_prefix_pack_step()
+    raw_state = torch.tensor([[10.0, 20.0, 25.0]])
+    absolute_chunk = torch.tensor(
+        [
+            [
+                [12.0, 18.0, 50.0],
+                [7.0, 31.0, 0.0],
+                [22.0, 5.0, 100.0],
+            ]
+        ]
+    )
+
+    # What training does with this chunk against this state.
+    trained = step._normalize_action_groups_for_training(
+        step._convert_relative_action_groups_for_training(absolute_chunk.clone(), raw_state)
+    )
+
+    _cache_raw_state(step, raw_state)
+    prefix = step.encode_absolute_rtc_prefix(absolute_chunk.squeeze(0))
+
+    torch.testing.assert_close(prefix, trained)
+
+
+def test_groot_n1_7_rtc_prefix_reanchors_against_the_latest_observation():
+    step = _non_eef_prefix_pack_step()
+    prefix_absolute = torch.tensor([[20.0, 20.0, 50.0]] * 3)
+
+    _cache_raw_state(step, torch.tensor([[10.0, 20.0, 25.0]]))
+    encoded_old_anchor = step.encode_absolute_rtc_prefix(prefix_absolute)
+
+    _cache_raw_state(step, torch.tensor([[15.0, 20.0, 25.0]]))
+    encoded_new_anchor = step.encode_absolute_rtc_prefix(prefix_absolute)
+
+    # Same absolute tail, newer anchor: the encoded deltas must shrink by the state change.
+    torch.testing.assert_close(encoded_new_anchor[0, 0, 0], torch.tensor(0.5), atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(encoded_old_anchor[0, 0, 0], torch.tensor(1.0), atol=1e-6, rtol=1e-6)
+
+
+def test_groot_n1_7_rtc_prefix_round_trips_through_the_action_decode_step():
+    """Encoding then decoding a prefix must recover the absolute actions it came from."""
+    step = _non_eef_prefix_pack_step()
+    raw_state = torch.tensor([[10.0, 20.0, 25.0]])
+    _cache_raw_state(step, raw_state)
+    prefix_absolute = torch.tensor(
+        [
+            [12.0, 18.0, 50.0],
+            [7.0, 31.0, 0.0],
+            [22.0, 5.0, 100.0],
+        ]
+    )
+
+    encoded = step.encode_absolute_rtc_prefix(prefix_absolute)
+
+    decode = GrootN17ActionDecodeStep(
+        env_action_dim=3,
+        raw_stats=step.raw_stats,
+        modality_config=step.modality_config,
+        use_relative_action=True,
+        pack_step=step,
+    )
+    decoded = decode({TransitionKey.ACTION: encoded})[TransitionKey.ACTION]
+
+    torch.testing.assert_close(decoded[0], prefix_absolute, atol=1e-4, rtol=1e-4)
+
+
+def _eef_prefix_pack_step(**kwargs):
+    return _relative_rtc_pack_step(
+        action_configs=[
+            {"rep": "RELATIVE", "type": "EEF", "format": "XYZ_ROT6D", "state_key": "eef"},
+        ],
+        state_keys=["eef"],
+        action_keys=["eef"],
+        state_dims={"eef": 9},
+        relative_stats={
+            "eef": {
+                "min": [[-2.0] * 9, [-4.0] * 9],
+                "max": [[2.0] * 9, [4.0] * 9],
+            }
+        },
+        absolute_stats={"eef": {"min": [-10.0] * 9, "max": [10.0] * 9}},
+        horizon=2,
+        **kwargs,
+    )
+
+
+def _random_xyz_rot6d(rng):
+    rotation, _ = np.linalg.qr(rng.normal(size=(3, 3)))
+    if np.linalg.det(rotation) < 0:
+        rotation[:, 0] *= -1
+    return np.concatenate([rng.normal(size=3), rotation[:2].reshape(-1)]).astype(np.float32)
+
+
+def test_groot_n1_7_rtc_prefix_composes_se3_deltas_for_eef_groups():
+    step = _eef_prefix_pack_step()
+    rng = np.random.default_rng(1)
+    reference = _random_xyz_rot6d(rng)[None, :]
+    prefix_absolute = np.stack([_random_xyz_rot6d(rng) for _ in range(2)])[None, :]
+    _cache_raw_state(step, torch.from_numpy(reference))
+
+    encoded = step.encode_absolute_rtc_prefix(torch.from_numpy(prefix_absolute))
+
+    expected_relative = absolute_eef_to_relative(prefix_absolute, reference)
+    # Row i is normalized with relative stats row i: [-2, 2] then [-4, 4].
+    expected = np.stack(
+        [
+            expected_relative[0, 0] / 2.0,
+            expected_relative[0, 1] / 4.0,
+        ]
+    )[None, :]
+    torch.testing.assert_close(encoded, torch.from_numpy(expected), atol=1e-5, rtol=1e-5)
+
+
+def test_groot_n1_7_rtc_prefix_eef_delta_is_not_an_elementwise_offset():
+    """Guard against the elementwise `action - state` shortcut for rotation dims."""
+    step = _eef_prefix_pack_step()
+    rng = np.random.default_rng(2)
+    reference = _random_xyz_rot6d(rng)[None, :]
+    prefix_absolute = np.stack([_random_xyz_rot6d(rng) for _ in range(2)])[None, :]
+    _cache_raw_state(step, torch.from_numpy(reference))
+
+    encoded = step.encode_absolute_rtc_prefix(torch.from_numpy(prefix_absolute))
+
+    elementwise = (prefix_absolute - reference[:, None, :]) / np.array([2.0, 4.0])[None, :, None]
+    assert np.abs(encoded.numpy() - elementwise).max() > 1e-3
+
+
+def test_groot_n1_7_rtc_prefix_is_skipped_for_absolute_action_checkpoints():
+    step = _relative_rtc_pack_step(
+        action_configs=[{"rep": "ABSOLUTE", "type": "NON_EEF", "format": "DEFAULT", "state_key": None}],
+        state_keys=["single_arm"],
+        action_keys=["single_arm"],
+        state_dims={"single_arm": 2},
+        relative_stats={},
+        absolute_stats={"single_arm": {"min": [-100.0, -100.0], "max": [100.0, 100.0]}},
+    )
+    _cache_raw_state(step, torch.tensor([[10.0, 20.0]]))
+
+    assert step.uses_relative_rtc_prefix() is False
+    assert step.encode_absolute_rtc_prefix(torch.zeros(3, 2)) is None
+
+
+def test_groot_n1_7_rtc_prefix_needs_a_cached_anchor_state():
+    step = _non_eef_prefix_pack_step()
+
+    assert step.uses_relative_rtc_prefix() is True
+    assert step.encode_absolute_rtc_prefix(torch.zeros(3, 3)) is None
+
+
+def test_groot_n1_7_rtc_prefix_refuses_non_invertible_action_decode_transform():
+    step = _non_eef_prefix_pack_step(action_decode_transform=GROOT_ACTION_DECODE_TRANSFORM_LIBERO)
+    _cache_raw_state(step, torch.tensor([[10.0, 20.0, 25.0]]))
+
+    assert step.encode_absolute_rtc_prefix(torch.zeros(3, 3)) is None
+
+
+def test_groot_n1_7_rtc_prefix_truncates_to_available_relative_stats_rows():
+    step = _non_eef_prefix_pack_step()
+    _cache_raw_state(step, torch.tensor([[10.0, 20.0, 25.0]]))
+
+    # 5 leftover steps, but the checkpoint only carries 3 per-horizon stats rows.
+    encoded = step.encode_absolute_rtc_prefix(torch.tensor([[10.0, 20.0, 25.0]] * 5))
+
+    assert encoded.shape == (1, 3, 3)
+
+
+def test_groot_n1_7_rtc_prefix_rejects_unsupported_relative_action_format():
+    step = _relative_rtc_pack_step(
+        action_configs=[{"rep": "RELATIVE", "type": "EEF", "format": "XYZ_ROTVEC", "state_key": "eef"}],
+        state_keys=["eef"],
+        action_keys=["eef"],
+        state_dims={"eef": 6},
+        relative_stats={"eef": {"min": [[-1.0] * 6], "max": [[1.0] * 6]}},
+        absolute_stats={"eef": {"min": [-1.0] * 6, "max": [1.0] * 6}},
+        horizon=1,
+    )
+    _cache_raw_state(step, torch.zeros(1, 6))
+
+    with pytest.raises(ValueError, match="Unsupported relative N1.7 action config"):
+        step.encode_absolute_rtc_prefix(torch.zeros(1, 6))
+
+
+def test_groot_n1_7_relative_rtc_chunk_boundary_receives_reanchored_prefix():
+    """Two-chunk simulation of the RTC loop: the model must see the re-anchored tail.
+
+    Mirrors ``RTCInferenceEngine._rtc_loop`` for a native relative-action checkpoint:
+    predict, postprocess to absolute, queue, consume, then re-anchor the absolute tail
+    against the *next* observation and hand it to the policy as the RTC prefix.
+    """
+    from lerobot.policies.rtc import ActionQueue
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+
+    pack_step = _non_eef_prefix_pack_step()
+    decode_step = GrootN17ActionDecodeStep(
+        env_action_dim=3,
+        raw_stats=pack_step.raw_stats,
+        modality_config=pack_step.modality_config,
+        use_relative_action=True,
+        pack_step=pack_step,
+    )
+    policy = object.__new__(GrootPolicy)
+    policy.config = SimpleNamespace(
+        use_relative_actions=True,
+        chunk_size=3,
+        max_action_dim=3,
+        rtc_config=RTCConfig(execution_horizon=3),
+    )
+    policy._groot_model = SimpleNamespace(config=SimpleNamespace(action_horizon=3, max_action_dim=3))
+
+    # --- chunk 1: predicted from state_1, executed for one step ---
+    state_1 = torch.tensor([[10.0, 20.0, 25.0]])
+    _cache_raw_state(pack_step, state_1)
+    model_chunk_1 = torch.tensor([[[0.2, -0.4, 0.5], [-0.1, 0.3, 0.0], [0.6, 0.1, -0.5]]])
+    absolute_chunk_1 = decode_step({TransitionKey.ACTION: model_chunk_1.clone()})[TransitionKey.ACTION]
+
+    queue = ActionQueue(RTCConfig(execution_horizon=3))
+    queue.merge(model_chunk_1.squeeze(0).clone(), absolute_chunk_1.squeeze(0).clone(), real_delay=0)
+    queue.get()
+
+    model_space_leftovers = queue.get_left_over()
+    absolute_leftovers = queue.get_processed_left_over()
+
+    # --- chunk 2: the arm has moved, so the anchor changed ---
+    state_2 = torch.tensor([[11.5, 19.0, 25.0]])
+    _cache_raw_state(pack_step, state_2)
+    prefix = pack_step.encode_absolute_rtc_prefix(absolute_leftovers)
+
+    groot_inputs, options = policy._prepare_n1_7_rtc_inputs(
+        {"state": torch.zeros(1, 1, 3)},
+        inference_delay=0,
+        prev_chunk_left_over=prefix.squeeze(0),
+        prev_chunk_left_over_reanchored=True,
+    )
+
+    assert options["rtc_overlap_steps"] == 2
+    torch.testing.assert_close(groot_inputs["action"], prefix)
+    # Re-anchoring is not a no-op: the queue's model-space rows are stale deltas against
+    # state_1 and normalized with the horizon rows they had in the previous chunk.
+    assert (prefix.squeeze(0) - model_space_leftovers).abs().max() > 1e-3
+    # And the prefix still means the same commanded poses under the new anchor.
+    torch.testing.assert_close(
+        decode_step({TransitionKey.ACTION: prefix})[TransitionKey.ACTION],
+        absolute_leftovers.unsqueeze(0),
+        atol=1e-4,
+        rtol=1e-4,
+    )
+
+
+def test_groot_n1_7_pack_step_learns_the_postprocessor_action_decode_transform(tmp_path):
+    model_path = tmp_path / "libero_spatial"
+    _write_raw_n1_7_libero_checkpoint(model_path)
+    config = _raw_n1_7_libero_config(model_path)
+
+    preprocessor, postprocessor = make_pre_post_processors(config, pretrained_path=str(model_path))
+
+    pack_step = next(step for step in preprocessor.steps if isinstance(step, GrootN17PackInputsStep))
+    decode_step = next(step for step in postprocessor.steps if isinstance(step, GrootN17ActionDecodeStep))
+    assert pack_step.action_decode_transform == GROOT_ACTION_DECODE_TRANSFORM_LIBERO
+    assert decode_step.action_decode_transform == GROOT_ACTION_DECODE_TRANSFORM_LIBERO
 
 
 def test_groot_n1_7_pack_inputs_adds_inference_action_horizon_mask():
