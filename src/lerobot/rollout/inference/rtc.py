@@ -290,6 +290,11 @@ class RTCInferenceEngine(InferenceEngine):
                         current_time = time.perf_counter()
                         idx_before = queue.get_action_index()
                         prev_actions = queue.get_left_over()
+                        # Sampled here, next to `idx_before` and the observation read above,
+                        # rather than after preprocessing: the control loop keeps consuming
+                        # actions meanwhile, so a later read starts further along the queue and
+                        # would misalign row i of the tail with step i of the chunk.
+                        prev_actions_absolute = queue.get_processed_left_over()
 
                         latency = latency_tracker.max()
                         delay = math.ceil(latency / time_per_chunk) if latency else 0
@@ -306,16 +311,17 @@ class RTCInferenceEngine(InferenceEngine):
                             # Rebase against the raw cached state so the leftover tail stays in
                             # the training-time coordinate frame.
                             raw_state = self._relative_step.get_cached_state()
-                            if raw_state is not None:
-                                prev_abs = queue.get_processed_left_over()
-                                if prev_abs is not None and prev_abs.numel() > 0:
-                                    prev_actions = reanchor_relative_rtc_prefix(
-                                        prev_actions_absolute=prev_abs,
-                                        current_state=raw_state,
-                                        relative_step=self._relative_step,
-                                        normalizer_step=self._normalizer_step,
-                                        policy_device=policy_device,
-                                    )
+                            has_absolute_tail = (
+                                prev_actions_absolute is not None and prev_actions_absolute.numel() > 0
+                            )
+                            if raw_state is not None and has_absolute_tail:
+                                prev_actions = reanchor_relative_rtc_prefix(
+                                    prev_actions_absolute=prev_actions_absolute,
+                                    current_state=raw_state,
+                                    relative_step=self._relative_step,
+                                    normalizer_step=self._normalizer_step,
+                                    policy_device=policy_device,
+                                )
 
                         if prev_actions is not None:
                             prev_actions = _normalize_prev_actions_length(
