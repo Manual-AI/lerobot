@@ -19,13 +19,16 @@ from .action_queue import ActionQueue
 from .configuration_rtc import RTCConfig
 from .latency_tracker import LatencyTracker
 from .modeling_rtc import RTCProcessor
-from .relative import reanchor_relative_rtc_prefix
+from .relative import RelativeRTCPrefixEncoder, reanchor_relative_rtc_prefix
+from .seam_tracker import ChunkSeamTracker
 
 __all__ = [
     "ActionInterpolator",
     "ActionQueue",
+    "ChunkSeamTracker",
     "LatencyTracker",
     "RTCConfig",
     "RTCProcessor",
+    "RelativeRTCPrefixEncoder",
     "reanchor_relative_rtc_prefix",
 ]

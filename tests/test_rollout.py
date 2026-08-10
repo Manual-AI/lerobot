@@ -364,6 +364,175 @@ def test_create_inference_engine_sync():
 
 
 # ---------------------------------------------------------------------------
+# RTC engine: native relative-action prefix and chunk-seam measurement
+# ---------------------------------------------------------------------------
+
+
+class _FakePrefixEncoder:
+    """Stands in for a preprocessor step implementing ``RelativeRTCPrefixEncoder``."""
+
+    def __init__(self, *, owns_prefix=True, encoded=None):
+        self._owns_prefix = owns_prefix
+        self._encoded = encoded
+        self.calls = []
+
+    def uses_relative_rtc_prefix(self):
+        return self._owns_prefix
+
+    def encode_absolute_rtc_prefix(self, prev_actions_absolute):
+        self.calls.append(prev_actions_absolute)
+        return self._encoded
+
+
+def _make_rtc_engine(steps, **rtc_kwargs):
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+    from lerobot.rollout.inference.rtc import RTCInferenceEngine
+
+    return RTCInferenceEngine(
+        policy=MagicMock(),
+        preprocessor=SimpleNamespace(steps=steps),
+        postprocessor=MagicMock(),
+        robot_wrapper=MagicMock(robot_type="mock"),
+        rtc_config=RTCConfig(execution_horizon=4, **rtc_kwargs),
+        hw_features={},
+        task="test",
+        fps=30.0,
+        device="cpu",
+    )
+
+
+def test_rtc_engine_detects_native_relative_prefix_encoder():
+    encoder = _FakePrefixEncoder()
+
+    engine = _make_rtc_engine([encoder])
+
+    assert engine._prefix_encoder is encoder
+
+
+def test_rtc_engine_ignores_prefix_encoder_that_does_not_own_the_prefix():
+    engine = _make_rtc_engine([_FakePrefixEncoder(owns_prefix=False)])
+
+    assert engine._prefix_encoder is None
+
+
+def test_rtc_engine_encodes_absolute_leftovers_and_drops_the_batch_dim():
+    encoder = _FakePrefixEncoder(encoded=torch.ones(1, 3, 5))
+    engine = _make_rtc_engine([encoder])
+    leftovers = torch.arange(15, dtype=torch.float32).view(3, 5)
+
+    prefix = engine._encode_native_relative_prefix(leftovers, torch.device("cpu"))
+
+    torch.testing.assert_close(encoder.calls[0], leftovers)
+    assert prefix.shape == (3, 5)
+
+
+def test_rtc_engine_runs_unguided_when_the_encoder_declines():
+    encoder = _FakePrefixEncoder(encoded=None)
+    engine = _make_rtc_engine([encoder])
+
+    assert engine._encode_native_relative_prefix(torch.zeros(3, 5), torch.device("cpu")) is None
+
+
+def test_rtc_engine_skips_prefix_encoding_without_leftovers():
+    encoder = _FakePrefixEncoder(encoded=torch.ones(1, 3, 5))
+    engine = _make_rtc_engine([encoder])
+
+    assert engine._encode_native_relative_prefix(None, torch.device("cpu")) is None
+    assert engine._encode_native_relative_prefix(torch.zeros(0, 5), torch.device("cpu")) is None
+    assert encoder.calls == []
+
+
+def test_rtc_engine_prefix_selection_prefers_the_native_encoder():
+    encoder = _FakePrefixEncoder(encoded=torch.full((1, 3, 5), 0.5))
+    engine = _make_rtc_engine([encoder])
+    model_space_leftovers = torch.zeros(3, 5)
+    absolute_leftovers = torch.arange(15, dtype=torch.float32).view(3, 5)
+
+    prefix, reanchored = engine._prepare_rtc_prefix(
+        model_space_leftovers, absolute_leftovers, torch.device("cpu")
+    )
+
+    assert reanchored is True
+    torch.testing.assert_close(encoder.calls[0], absolute_leftovers)
+    # Padded to execution_horizon=4 for a fixed-shape policy call.
+    assert prefix.shape == (4, 5)
+    torch.testing.assert_close(prefix[3], torch.zeros(5))
+
+
+def test_rtc_engine_prefix_selection_honors_the_prefix_guidance_ablation():
+    encoder = _FakePrefixEncoder(encoded=torch.ones(1, 3, 5))
+    engine = _make_rtc_engine([encoder], prefix_guidance=False)
+
+    prefix, reanchored = engine._prepare_rtc_prefix(torch.zeros(3, 5), torch.zeros(3, 5), torch.device("cpu"))
+
+    assert prefix is None
+    assert reanchored is False
+    assert encoder.calls == []
+
+
+def test_rtc_engine_prefix_selection_passes_absolute_policies_through_unchanged():
+    engine = _make_rtc_engine([])
+    leftovers = torch.arange(15, dtype=torch.float32).view(3, 5)
+
+    prefix, reanchored = engine._prepare_rtc_prefix(leftovers, leftovers, torch.device("cpu"))
+
+    assert reanchored is False
+    torch.testing.assert_close(prefix[:3], leftovers)
+
+
+def test_rtc_engine_measures_the_chunk_seam_at_the_delayed_row():
+    from lerobot.policies.rtc import ActionQueue
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+
+    engine = _make_rtc_engine([])
+    queue = ActionQueue(RTCConfig(execution_horizon=4))
+    outgoing = torch.zeros(6, 2)
+    queue.merge(outgoing.clone(), outgoing.clone(), real_delay=0)
+    queue.get()
+
+    incoming = torch.tensor([[9.0, 9.0], [0.25, -0.5], [7.0, 7.0]])
+    engine._record_chunk_seam(queue, incoming, new_delay=1)
+
+    # Row 1 is what the robot executes first, so that is the row the seam compares.
+    summary = engine.seam_summary
+    assert summary["boundaries"] == 1.0
+    assert summary["max_abs_mean"] == 0.5
+
+
+def test_rtc_engine_reports_no_seam_before_the_first_chunk():
+    from lerobot.policies.rtc import ActionQueue
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+
+    engine = _make_rtc_engine([])
+    queue = ActionQueue(RTCConfig(execution_horizon=4))
+
+    engine._record_chunk_seam(queue, torch.ones(3, 2), new_delay=0)
+
+    assert engine.seam_summary["boundaries"] == 0.0
+
+
+def test_rtc_engine_skips_seam_measurement_when_chunks_are_appended():
+    """With RTC disabled the queue appends instead of swapping, so there is no seam."""
+    from lerobot.policies.rtc import ActionQueue
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+
+    engine = _make_rtc_engine([], enabled=False)
+    queue = ActionQueue(RTCConfig(enabled=False, execution_horizon=4))
+    queue.merge(torch.zeros(4, 2), torch.zeros(4, 2), real_delay=0)
+
+    engine._record_chunk_seam(queue, torch.ones(3, 2), new_delay=0)
+
+    assert engine.seam_summary["boundaries"] == 0.0
+
+
+def test_rtc_config_prefix_guidance_defaults_to_enabled():
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+
+    assert RTCConfig().prefix_guidance is True
+    assert RTCConfig(prefix_guidance=False).prefix_guidance is False
+
+
+# ---------------------------------------------------------------------------
 # Pure functions
 # ---------------------------------------------------------------------------
 

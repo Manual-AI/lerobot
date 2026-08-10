@@ -33,7 +33,13 @@ from typing import Any
 import torch
 
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.policies.rtc import ActionQueue, LatencyTracker, reanchor_relative_rtc_prefix
+from lerobot.policies.rtc import (
+    ActionQueue,
+    ChunkSeamTracker,
+    LatencyTracker,
+    RelativeRTCPrefixEncoder,
+    reanchor_relative_rtc_prefix,
+)
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.policies.utils import prepare_observation_for_inference
 from lerobot.processor import (
@@ -156,6 +162,8 @@ class RTCInferenceEngine(InferenceEngine):
                 compile_warmup_inferences,
             )
 
+        self._seam_tracker = ChunkSeamTracker()
+
         # Processor introspection for relative-action re-anchoring.
         self._relative_step = next(
             (s for s in preprocessor.steps if isinstance(s, RelativeActionsProcessorStep) and s.enabled),
@@ -165,6 +173,21 @@ class RTCInferenceEngine(InferenceEngine):
             (s for s in preprocessor.steps if isinstance(s, NormalizerProcessorStep)),
             None,
         )
+        # Policies whose relative actions need policy-specific re-anchoring (GR00T N1.7's
+        # per-horizon stats rows and SE(3) end-effector deltas) encode the prefix themselves.
+        self._prefix_encoder = next(
+            (
+                s
+                for s in preprocessor.steps
+                if isinstance(s, RelativeRTCPrefixEncoder) and s.uses_relative_rtc_prefix()
+            ),
+            None,
+        )
+        if self._prefix_encoder is not None:
+            logger.info(
+                "Native relative-action RTC prefix enabled: %s will re-anchor absolute leftovers",
+                type(self._prefix_encoder).__name__,
+            )
         if self._relative_step is not None:
             if self._relative_step.action_names is None:
                 cfg_names = getattr(policy.config, "action_feature_names", None)
@@ -214,6 +237,7 @@ class RTCInferenceEngine(InferenceEngine):
     def stop(self) -> None:
         """Signal the RTC thread to stop and wait for it."""
         logger.info("Stopping RTC inference thread...")
+        self._log_chunk_seam_summary()
         self._shutdown_event.set()
         self._policy_active.clear()
         if self._rtc_thread is not None and self._rtc_thread.is_alive():
@@ -240,6 +264,8 @@ class RTCInferenceEngine(InferenceEngine):
         self._policy.reset()
         self._preprocessor.reset()
         self._postprocessor.reset()
+        self._log_chunk_seam_summary()
+        self._seam_tracker.reset()
         if self._action_queue is not None:
             self._action_queue.clear()
 
@@ -261,6 +287,113 @@ class RTCInferenceEngine(InferenceEngine):
     # ------------------------------------------------------------------
     # RTC: background inference thread
     # ------------------------------------------------------------------
+
+    def _prepare_rtc_prefix(
+        self,
+        prev_actions: torch.Tensor | None,
+        prev_actions_absolute: torch.Tensor | None,
+        policy_device: torch.device,
+    ) -> tuple[torch.Tensor | None, bool]:
+        """Turn the previous chunk's leftovers into the prefix this chunk is conditioned on.
+
+        Must be called after the preprocessor has run, so relative-action re-anchoring sees
+        the state of the observation this chunk is predicted from. Returns the prefix (or
+        ``None`` to predict unguided) and whether it was re-anchored by the policy's own
+        encoder, which the policy needs to know before trusting a relative-action prefix.
+        """
+        if not self._rtc_config.prefix_guidance:
+            # Ablation: keep asynchronous chunk replacement, drop seam conditioning.
+            return None, False
+
+        reanchored = False
+        if self._prefix_encoder is not None:
+            # The queue's model-space leftovers are deltas against the previous observation;
+            # only the absolute tail can be re-anchored to this one.
+            prev_actions = self._encode_native_relative_prefix(prev_actions_absolute, policy_device)
+            reanchored = prev_actions is not None
+        elif prev_actions is not None and self._relative_step is not None:
+            # Rebase against the raw cached state so the leftover tail stays in the
+            # training-time coordinate frame.
+            raw_state = self._relative_step.get_cached_state()
+            has_absolute_tail = prev_actions_absolute is not None and prev_actions_absolute.numel() > 0
+            if raw_state is not None and has_absolute_tail:
+                prev_actions = reanchor_relative_rtc_prefix(
+                    prev_actions_absolute=prev_actions_absolute,
+                    current_state=raw_state,
+                    relative_step=self._relative_step,
+                    normalizer_step=self._normalizer_step,
+                    policy_device=policy_device,
+                )
+
+        if prev_actions is not None:
+            prev_actions = _normalize_prev_actions_length(
+                prev_actions, target_steps=self._rtc_config.execution_horizon
+            )
+        return prev_actions, reanchored
+
+    def _encode_native_relative_prefix(
+        self, prev_actions_absolute: torch.Tensor | None, policy_device: torch.device
+    ) -> torch.Tensor | None:
+        """Re-anchor the absolute leftover tail via the policy's own prefix encoder.
+
+        Must run after the preprocessor, so the encoder re-anchors against the state of
+        the observation this chunk is predicted from. Returns ``None`` when there is no
+        tail yet or the encoder declines, in which case the chunk runs unguided.
+        """
+        if self._prefix_encoder is None:
+            return None
+        if prev_actions_absolute is None or prev_actions_absolute.numel() == 0:
+            return None
+
+        encoded = self._prefix_encoder.encode_absolute_rtc_prefix(prev_actions_absolute)
+        if encoded is None:
+            return None
+        if encoded.ndim == 3:
+            if encoded.shape[0] != 1:
+                raise ValueError(
+                    "RTC expects a single-environment prefix, but the prefix encoder returned batch "
+                    f"size {encoded.shape[0]}."
+                )
+            encoded = encoded.squeeze(0)
+        return encoded.to(policy_device)
+
+    def _record_chunk_seam(self, queue: ActionQueue, processed: torch.Tensor, new_delay: int) -> None:
+        """Measure the commanded-action jump this chunk swap will cause.
+
+        Compares the action the outgoing chunk would command next against the first
+        action the incoming chunk actually commands (its row at the resolved inference
+        delay, which is what ``ActionQueue.merge`` drops the queue to). Only meaningful
+        when the queue is replaced per chunk; with RTC disabled chunks are appended, so
+        there is no boundary to measure.
+        """
+        if not self._rtc_config.enabled:
+            return
+        outgoing_tail = queue.get_processed_left_over()
+        if outgoing_tail is None or len(outgoing_tail) == 0 or len(processed) == 0:
+            return
+        incoming_index = max(0, min(new_delay, len(processed) - 1))
+        gap = self._seam_tracker.record(outgoing_tail[0], processed[incoming_index])
+        if gap is not None:
+            logger.debug("RTC chunk seam discontinuity: max_abs=%.5f", gap)
+
+    def _log_chunk_seam_summary(self) -> None:
+        """Log aggregate chunk-boundary continuity for this rollout."""
+        if len(self._seam_tracker) == 0:
+            return
+        summary = self._seam_tracker.summary()
+        logger.info(
+            "RTC chunk seam continuity over %d boundaries: max_abs mean=%.5f p95=%.5f max=%.5f, l2 mean=%.5f",
+            int(summary["boundaries"]),
+            summary["max_abs_mean"],
+            summary["max_abs_p95"],
+            summary["max_abs_max"],
+            summary["l2_mean"],
+        )
+
+    @property
+    def seam_summary(self) -> dict[str, float]:
+        """Chunk-boundary discontinuity statistics in postprocessed action units."""
+        return self._seam_tracker.summary()
 
     def _rtc_loop(self) -> None:
         """Background thread that generates action chunks via RTC."""
@@ -307,30 +440,18 @@ class RTCInferenceEngine(InferenceEngine):
 
                         preprocessed = self._preprocessor(obs_batch)
 
-                        if prev_actions is not None and self._relative_step is not None:
-                            # Rebase against the raw cached state so the leftover tail stays in
-                            # the training-time coordinate frame.
-                            raw_state = self._relative_step.get_cached_state()
-                            has_absolute_tail = (
-                                prev_actions_absolute is not None and prev_actions_absolute.numel() > 0
-                            )
-                            if raw_state is not None and has_absolute_tail:
-                                prev_actions = reanchor_relative_rtc_prefix(
-                                    prev_actions_absolute=prev_actions_absolute,
-                                    current_state=raw_state,
-                                    relative_step=self._relative_step,
-                                    normalizer_step=self._normalizer_step,
-                                    policy_device=policy_device,
-                                )
-
-                        if prev_actions is not None:
-                            prev_actions = _normalize_prev_actions_length(
-                                prev_actions, target_steps=self._rtc_config.execution_horizon
-                            )
-
-                        actions = self._policy.predict_action_chunk(
-                            preprocessed, inference_delay=delay, prev_chunk_left_over=prev_actions
+                        prev_actions, prefix_reanchored = self._prepare_rtc_prefix(
+                            prev_actions, prev_actions_absolute, policy_device
                         )
+
+                        predict_kwargs: dict[str, Any] = {
+                            "inference_delay": delay,
+                            "prev_chunk_left_over": prev_actions,
+                        }
+                        if prefix_reanchored:
+                            predict_kwargs["prev_chunk_left_over_reanchored"] = True
+
+                        actions = self._policy.predict_action_chunk(preprocessed, **predict_kwargs)
 
                         original = actions.squeeze(0).clone()
                         processed = self._postprocessor(actions).squeeze(0)
@@ -345,6 +466,7 @@ class RTCInferenceEngine(InferenceEngine):
                         else:
                             latency_tracker.add(new_latency)
 
+                        self._record_chunk_seam(queue, processed, new_delay)
                         queue.merge(original, processed, new_delay, idx_before)
 
                         if (
