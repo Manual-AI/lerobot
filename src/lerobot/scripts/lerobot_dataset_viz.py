@@ -171,8 +171,19 @@ def visualize_dataset(
     display_mode: str = "rerun",
     host: str = "127.0.0.1",
     autoplay: bool = True,
+    recording_name: str | None = None,
     **kwargs,
 ) -> Path | None:
+    """Log one episode of `dataset` to Rerun, or serve it to Foxglove.
+
+    Args:
+        recording_name: Replaces the repo id in the Rerun `application_id` and the `.rrd`
+            filename. Two views of the same episode that differ in *what* they show -- a
+            different dataset revision, a narrowed set of signals -- must not share an
+            `application_id`, because that id owns a stored blueprint: the viewer would keep the
+            earlier view's series styling and apply it to the new data. Defaults to
+            `dataset.repo_id`.
+    """
     if display_mode == "foxglove":
         from lerobot.utils.foxglove_visualization import serve_foxglove_dataset_playback
 
@@ -192,7 +203,7 @@ def visualize_dataset(
             "Set an output directory where to write .rrd files with `--output-dir path/to/directory`."
         )
 
-    repo_id = dataset.repo_id
+    repo_id = recording_name or dataset.repo_id
 
     logging.info("Loading dataloader")
     dataloader = torch.utils.data.DataLoader(
@@ -214,6 +225,16 @@ def visualize_dataset(
     spawn_local_viewer = mode == "local" and not save
     blueprint = build_blueprint_from_dataset(dataset)
     rr.init(f"{repo_id}/episode_{episode_index}", spawn=spawn_local_viewer, default_blueprint=blueprint)
+
+    # `default_blueprint` is ignored whenever the viewer already holds an active blueprint for this
+    # application_id, so a re-run whose signals changed shape (fewer series after filtering, a
+    # different dataset revision) would silently inherit the previous layout: its per-dimension
+    # `SeriesLines` name override lands on the new data and the graphs come out mislabelled or
+    # empty. Sending it as active makes the layout follow the data being logged. Only for a live
+    # viewer -- a `.rrd` carries `default_blueprint`, and whoever opens it has no active blueprint
+    # for a name they have not seen.
+    if spawn_local_viewer:
+        rr.send_blueprint(blueprint, make_active=True)
 
     # Manually call python garbage collector after `rr.init` to avoid hanging in a blocking flush
     # when iterating on a dataloader with `num_workers` > 0
@@ -324,6 +345,15 @@ def main():
         type=Path,
         default=None,
         help="Root directory for the dataset stored locally (e.g. `--root data`). By default, the dataset will be loaded from hugging face cache folder, or downloaded from the hub if available.",
+    )
+    parser.add_argument(
+        "--revision",
+        type=str,
+        default=None,
+        help=(
+            "Git revision of the dataset to visualize: a branch, tag, or commit sha. Defaults to "
+            "the codebase version tag, so without it a repo's derived branches are invisible."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -443,12 +473,21 @@ def main():
     repo_id = kwargs.pop("repo_id")
     root = kwargs.pop("root")
     tolerance_s = kwargs.pop("tolerance_s")
+    revision = kwargs.pop("revision")
 
     init_logging()
     logging.info("Loading dataset")
-    dataset = LeRobotDataset(repo_id, episodes=[args.episode_index], root=root, tolerance_s=tolerance_s)
+    dataset = LeRobotDataset(
+        repo_id,
+        episodes=[args.episode_index],
+        root=root,
+        tolerance_s=tolerance_s,
+        revision=revision,
+    )
 
-    visualize_dataset(dataset, **kwargs)
+    # Keep revisions of one episode in separate recordings: same reason `recording_name` exists.
+    recording_name = repo_id if revision is None else f"{repo_id}@{revision}"
+    visualize_dataset(dataset, recording_name=recording_name, **kwargs)
 
 
 if __name__ == "__main__":
