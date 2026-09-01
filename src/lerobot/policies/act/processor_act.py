@@ -18,9 +18,13 @@ from typing import Any
 import torch
 
 from lerobot.processor import (
+    AnchoredAbsoluteEEFStep,
+    AnchoredRelativeEEFStep,
     PolicyAction,
     PolicyProcessorPipeline,
+    make_default_policy_processor_steps,
     make_default_pre_post_processors,
+    make_policy_processor_pipelines,
 )
 
 from .configuration_act import ACTConfig
@@ -47,4 +51,24 @@ def make_act_pre_post_processors(
         tuple[PolicyProcessorPipeline[dict[str, Any], dict[str, Any]], PolicyProcessorPipeline[PolicyAction, PolicyAction]]: A tuple containing the
         pre-processor pipeline and the post-processor pipeline.
     """
-    return make_default_pre_post_processors(config, dataset_stats, normalizer_device=config.device)
+    if not config.relative_actions:
+        return make_default_pre_post_processors(config, dataset_stats, normalizer_device=config.device)
+
+    steps = make_default_policy_processor_steps(config, dataset_stats, normalizer_device=config.device)
+    relative_step = AnchoredRelativeEEFStep(enabled=True, eef_starts=list(config.relative_eef_starts))
+    absolute_step = AnchoredAbsoluteEEFStep(
+        enabled=True,
+        eef_starts=list(config.relative_eef_starts),
+        n_action_steps=config.n_action_steps,
+        relative_step=relative_step,
+    )
+    return make_policy_processor_pipelines(
+        input_steps=[
+            steps.rename_observations,
+            steps.add_batch_dim,
+            steps.to_device,
+            relative_step,
+            steps.normalize,
+        ],
+        output_steps=[steps.unnormalize, absolute_step, steps.to_cpu],
+    )
