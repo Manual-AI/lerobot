@@ -31,6 +31,8 @@ from lerobot.envs import EnvConfig, env_to_policy_features
 from lerobot.lerobot_types import PolicyAction
 from lerobot.processor import (
     AbsoluteActionsProcessorStep,
+    AnchoredAbsoluteEEFStep,
+    AnchoredRelativeEEFStep,
     PolicyProcessorPipeline,
     RelativeActionsProcessorStep,
     batch_to_transition,
@@ -62,19 +64,25 @@ else:
 def _reconnect_relative_absolute_steps(
     preprocessor: PolicyProcessorPipeline, postprocessor: PolicyProcessorPipeline
 ) -> None:
-    """Wire AbsoluteActionsProcessorStep.relative_step to the RelativeActionsProcessorStep after deserialization.
+    """Reconnect relative/absolute processor step pairs after deserialization.
 
-    After a policy is loaded from disk, the preprocessor and postprocessor are reconstructed
-    independently from their configs. AbsoluteActionsProcessorStep needs a live reference to
-    the RelativeActionsProcessorStep so it can read the cached state at inference time.
-    That reference is not serializable, so we re-establish it here after loading.
+    Preprocessor and postprocessor configs are loaded independently, while both absolute
+    processor variants need a live reference to their paired relative step's state cache.
+    Those references are not serializable, so re-establish them after loading.
     """
     relative_step = next((s for s in preprocessor.steps if isinstance(s, RelativeActionsProcessorStep)), None)
-    if relative_step is None:
-        return
-    for step in postprocessor.steps:
-        if isinstance(step, AbsoluteActionsProcessorStep) and step.relative_step is None:
-            step.relative_step = relative_step
+    if relative_step is not None:
+        for step in postprocessor.steps:
+            if isinstance(step, AbsoluteActionsProcessorStep) and step.relative_step is None:
+                step.relative_step = relative_step
+
+    anchored_relative_step = next(
+        (s for s in preprocessor.steps if isinstance(s, AnchoredRelativeEEFStep)), None
+    )
+    if anchored_relative_step is not None:
+        for step in postprocessor.steps:
+            if isinstance(step, AnchoredAbsoluteEEFStep) and step.relative_step is None:
+                step.relative_step = anchored_relative_step
 
 
 def get_policy_class(name: str) -> type[PreTrainedPolicy]:

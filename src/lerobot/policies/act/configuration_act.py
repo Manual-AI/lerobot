@@ -118,6 +118,12 @@ class ACTConfig(PreTrainedConfig):
     # Note: the value used in ACT when temporal ensembling is enabled is 0.01.
     temporal_ensemble_coeff: float | None = None
 
+    # Chunk-anchored relative EEF actions. Each 9-dim xyz+rot6d block starts at
+    # one entry in relative_eef_starts; remaining dimensions use scalar offsets.
+    # Dataset action statistics must be computed over these deltas.
+    relative_actions: bool = False
+    relative_eef_starts: list[int] = field(default_factory=list)
+
     # Training and loss computation.
     dropout: float = 0.1
     kl_weight: float = 10.0
@@ -140,6 +146,15 @@ class ACTConfig(PreTrainedConfig):
                 "`n_action_steps` must be 1 when using temporal ensembling. This is "
                 "because the policy needs to be queried every step to compute the ensembled action."
             )
+        if self.relative_actions and self.temporal_ensemble_coeff is not None:
+            raise ValueError(
+                "relative_actions is incompatible with temporal ensembling because the ensembler "
+                "would combine deltas expressed against different observation anchors."
+            )
+        if self.relative_actions:
+            for start in self.relative_eef_starts:
+                if start < 0:
+                    raise ValueError(f"relative_eef_starts must be non-negative, got {start}.")
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
