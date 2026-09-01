@@ -37,6 +37,10 @@ class RTCConfig:
     # Infrastructure
     enabled: bool = True
 
+    # ``guided`` is the original inference-time Jacobian guidance. ``trained``
+    # hard-inpaints a prefix and requires a compatible training-time RTC checkpoint.
+    mode: str = "guided"
+
     # Core RTC settings
     # Todo change to exp
     prefix_attention_schedule: RTCAttentionSchedule = RTCAttentionSchedule.LINEAR
@@ -54,6 +58,13 @@ class RTCConfig:
 
     def __post_init__(self):
         """Validate RTC configuration parameters."""
+        if self.mode not in {"guided", "trained"}:
+            raise ValueError(f"mode must be 'guided' or 'trained', got {self.mode!r}")
+        if self.enabled and self.mode == "trained" and not self.prefix_guidance:
+            raise ValueError(
+                "RTC mode='trained' requires prefix_guidance=True; use mode='guided' with "
+                "prefix_guidance=False for an unguided latency-hiding ablation."
+            )
         if self.max_guidance_weight <= 0:
             raise ValueError(f"max_guidance_weight must be positive, got {self.max_guidance_weight}")
         if self.debug_maxlen <= 0:
