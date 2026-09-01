@@ -15,7 +15,7 @@
 """Real-Time Chunking (RTC) utilities for action-chunking policies."""
 
 from .action_interpolator import ActionInterpolator
-from .action_queue import ActionQueue
+from .action_queue import ActionQueue, ActionQueueMergeResult, ActionQueueSnapshot
 from .configuration_rtc import RTCConfig
 from .latency_tracker import LatencyTracker
 from .modeling_rtc import RTCProcessor
@@ -25,6 +25,8 @@ from .seam_tracker import ChunkSeamTracker
 __all__ = [
     "ActionInterpolator",
     "ActionQueue",
+    "ActionQueueMergeResult",
+    "ActionQueueSnapshot",
     "ChunkSeamTracker",
     "LatencyTracker",
     "RTCConfig",

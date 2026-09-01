@@ -15,12 +15,21 @@
 # limitations under the License.
 """Contract tests for DatasetReader."""
 
+import json
+import sys
+import types
+
 import pytest
+import torch
 
 pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
 
+from lerobot.datasets import LeRobotDataset, register_dataset_reader
 from lerobot.datasets.dataset_reader import DatasetReader
+from lerobot.datasets.language import LANGUAGE_EVENTS
+from lerobot.datasets.storage import _DATASET_READER_MODULES, DEFAULT_STORAGE_FORMAT, localize_remote_root
 from lerobot.utils.import_utils import get_safe_default_video_backend
+from tests.fixtures.constants import DUMMY_REPO_ID
 
 # ── Loading ──────────────────────────────────────────────────────────
 
@@ -64,6 +73,22 @@ def test_try_load_returns_false_when_no_data(tmp_path):
     )
     assert reader.try_load() is False
     assert reader.hf_dataset is None
+
+
+def test_load_rejects_language_columns_missing_from_metadata(tmp_path, lerobot_dataset_factory):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    dataset = lerobot_dataset_factory(
+        root=tmp_path / "ds", total_episodes=1, total_frames=10, use_videos=False
+    )
+    parquet_path = next((dataset.root / "data").glob("*/*.parquet"))
+    table = pq.read_table(parquet_path)
+    language_events = pa.array([[] for _ in range(len(table))], type=pa.list_(pa.string()))
+    pq.write_table(table.append_column(LANGUAGE_EVENTS, language_events), parquet_path)
+
+    with pytest.raises(ValueError, match=r"language feature\(s\) missing from metadata.*language_events"):
+        dataset.reader.load_and_activate()
 
 
 # ── Counts ───────────────────────────────────────────────────────────
@@ -170,3 +195,58 @@ def test_get_episodes_file_paths_includes_video_paths(tmp_path, lerobot_dataset_
     if len(dataset.meta.video_keys) > 0:
         paths = dataset.reader.get_episodes_file_paths()
         assert any("video" in str(p).lower() for p in paths)
+
+
+# ── Reader registry ──────────────────────────────────────────────────
+
+
+class ToyDatasetReader(DatasetReader):
+    def __init__(self, revision=None, token=None, **kwargs):
+        super().__init__(video_backend="pyav", **kwargs)
+
+
+def test_register_dataset_reader(tmp_path, lerobot_dataset_factory, monkeypatch):
+    root = tmp_path / "src"
+    lerobot_dataset_factory(
+        root=root, total_episodes=2, total_frames=60, use_videos=False, camera_features={}
+    )
+    plain_item = LeRobotDataset(DUMMY_REPO_ID, root=root)[0]
+
+    module = types.ModuleType("toyfmt_reader")
+    module.DATASET_READER = ToyDatasetReader
+    monkeypatch.setitem(sys.modules, "toyfmt_reader", module)
+    register_dataset_reader("toyfmt", "toyfmt_reader")
+    try:
+        info_path = root / "meta" / "info.json"
+        info = json.loads(info_path.read_text())
+        info["storage_format"] = "toyfmt"
+        info_path.write_text(json.dumps(info))
+
+        ds = LeRobotDataset(DUMMY_REPO_ID, root=root)
+        assert isinstance(ds.reader, ToyDatasetReader)
+        item = ds[0]
+        for key, expected in plain_item.items():
+            if isinstance(expected, torch.Tensor):
+                torch.testing.assert_close(item[key], expected, rtol=0, atol=0)
+
+        with pytest.raises(ValueError, match="already registered"):
+            register_dataset_reader("toyfmt", "some.other.module")
+        with pytest.raises(ValueError, match="already registered"):
+            register_dataset_reader(DEFAULT_STORAGE_FORMAT, "toyfmt_reader")
+
+        # a format whose optional deps are missing must not block probing the others
+        module.localize_root = lambda *args, **kwargs: root
+        broken = types.ModuleType("broken_reader")
+
+        def raise_import_error(*args, **kwargs):
+            raise ImportError("install some-extra")
+
+        broken.localize_root = raise_import_error
+        monkeypatch.setitem(sys.modules, "broken_reader", broken)
+        monkeypatch.setattr(
+            "lerobot.datasets.storage._DATASET_READER_MODULES",
+            {"broken": "broken_reader", "toyfmt": "toyfmt_reader"},
+        )
+        assert localize_remote_root(DUMMY_REPO_ID, "s3://bucket/ds") == root
+    finally:
+        _DATASET_READER_MODULES.pop("toyfmt", None)
