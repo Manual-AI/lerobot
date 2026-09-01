@@ -23,6 +23,7 @@ from lerobot.lerobot_types import (
     TransitionKey,
 )
 
+from .anchored_relative_processor import AnchoredAbsoluteEEFStep, AnchoredRelativeEEFStep
 from .batch_processor import AddBatchDimensionProcessorStep
 from .converters import (
     batch_to_transition,
@@ -105,6 +106,8 @@ from .tokenizer_processor import ActionTokenizerProcessorStep, TokenizerProcesso
 
 __all__ = [
     "ActionProcessorStep",
+    "AnchoredAbsoluteEEFStep",
+    "AnchoredRelativeEEFStep",
     "AddTeleopActionAsComplimentaryDataStep",
     "AddTeleopEventsAsInfoStep",
     "ComplementaryDataProcessorStep",
