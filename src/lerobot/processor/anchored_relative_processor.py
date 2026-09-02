@@ -16,7 +16,8 @@
 
 Each pose in a predicted chunk is expressed against the observation pose from
 which the chunk was predicted: ``delta_k = inverse(T_state) @ T_k``. Scalar
-action dimensions are represented by an elementwise offset from state.
+action dimensions are represented by an elementwise offset from state when
+``relative_scalars`` is set, otherwise they pass through unchanged (absolute).
 
 The rot6d convention is the first two rows of the rotation matrix, flattened.
 """
@@ -93,12 +94,15 @@ def _validate_inputs(actions: Tensor, state: Tensor, eef_starts: Sequence[int]) 
             )
 
 
-def anchored_delta(actions: Tensor, state: Tensor, eef_starts: Sequence[int]) -> Tensor:
+def anchored_delta(
+    actions: Tensor, state: Tensor, eef_starts: Sequence[int], relative_scalars: bool = True
+) -> Tensor:
     """Convert absolute actions to chunk-anchored relative actions.
 
     ``actions`` has shape ``(B, T, D)`` or ``(B, D)`` and ``state`` has shape
-    ``(B, Ds)``. Pose blocks use SE(3) composition while all other dimensions
-    use elementwise subtraction. SE(3) calculations use float64 internally.
+    ``(B, Ds)``. Pose blocks use SE(3) composition. All other dimensions use
+    elementwise subtraction when ``relative_scalars`` is set, otherwise they
+    pass through unchanged. SE(3) calculations use float64 internally.
     """
     _validate_inputs(actions, state, eef_starts)
     squeeze_time = actions.ndim == 2
@@ -106,7 +110,10 @@ def anchored_delta(actions: Tensor, state: Tensor, eef_starts: Sequence[int]) ->
     state = state.to(device=actions.device, dtype=actions.dtype)
     action_dim = actions.shape[-1]
 
-    result = actions_with_time - state[:, None, :action_dim]
+    if relative_scalars:
+        result = actions_with_time - state[:, None, :action_dim]
+    else:
+        result = actions_with_time.clone()  # fresh tensor: the pose writes below are in place
     for start in eef_starts:
         anchor_inverse = hom_inverse(pose9_to_hom(state[:, start : start + 9].double()))
         absolute = pose9_to_hom(actions_with_time[:, :, start : start + 9].double())
@@ -114,15 +121,24 @@ def anchored_delta(actions: Tensor, state: Tensor, eef_starts: Sequence[int]) ->
     return result.squeeze(1) if squeeze_time else result
 
 
-def anchored_compose(actions: Tensor, state: Tensor, eef_starts: Sequence[int]) -> Tensor:
-    """Compose chunk-anchored relative actions onto an absolute state anchor."""
+def anchored_compose(
+    actions: Tensor, state: Tensor, eef_starts: Sequence[int], relative_scalars: bool = True
+) -> Tensor:
+    """Compose chunk-anchored relative actions onto an absolute state anchor.
+
+    Pose blocks use SE(3) composition. All other dimensions are added back onto
+    ``state`` when ``relative_scalars`` is set, otherwise they pass through unchanged.
+    """
     _validate_inputs(actions, state, eef_starts)
     squeeze_time = actions.ndim == 2
     actions_with_time = actions.unsqueeze(1) if squeeze_time else actions
     state = state.to(device=actions.device, dtype=actions.dtype)
     action_dim = actions.shape[-1]
 
-    result = actions_with_time + state[:, None, :action_dim]
+    if relative_scalars:
+        result = actions_with_time + state[:, None, :action_dim]
+    else:
+        result = actions_with_time.clone()  # fresh tensor: the pose writes below are in place
     for start in eef_starts:
         anchor = pose9_to_hom(state[:, start : start + 9].double())
         relative = pose9_to_hom(actions_with_time[:, :, start : start + 9].double())
@@ -137,6 +153,7 @@ class AnchoredRelativeEEFStep(ProcessorStep):
 
     enabled: bool = False
     eef_starts: list[int] = field(default_factory=list)
+    relative_scalars: bool = True
     _last_state: Tensor | None = field(default=None, init=False, repr=False)
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
@@ -153,11 +170,17 @@ class AnchoredRelativeEEFStep(ProcessorStep):
             return transition
 
         new_transition = transition.copy()
-        new_transition[TransitionKey.ACTION] = anchored_delta(action, state, self.eef_starts)
+        new_transition[TransitionKey.ACTION] = anchored_delta(
+            action, state, self.eef_starts, self.relative_scalars
+        )
         return new_transition
 
     def get_config(self) -> dict[str, Any]:
-        return {"enabled": self.enabled, "eef_starts": list(self.eef_starts)}
+        return {
+            "enabled": self.enabled,
+            "eef_starts": list(self.eef_starts),
+            "relative_scalars": self.relative_scalars,
+        }
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
@@ -173,6 +196,7 @@ class AnchoredAbsoluteEEFStep(ProcessorStep):
     enabled: bool = False
     eef_starts: list[int] = field(default_factory=list)
     n_action_steps: int = 1
+    relative_scalars: bool = True
     relative_step: AnchoredRelativeEEFStep | None = field(default=None, repr=False)
     _anchor: Tensor | None = field(default=None, init=False, repr=False)
     _ticks: int = field(default=0, init=False, repr=False)
@@ -205,7 +229,9 @@ class AnchoredAbsoluteEEFStep(ProcessorStep):
             raise ValueError(f"actions must have shape (B, D) or (B, T, D), got {tuple(action.shape)}.")
 
         new_transition = transition.copy()
-        new_transition[TransitionKey.ACTION] = anchored_compose(action, anchor, self.eef_starts)
+        new_transition[TransitionKey.ACTION] = anchored_compose(
+            action, anchor, self.eef_starts, self.relative_scalars
+        )
         return new_transition
 
     def reset(self) -> None:
@@ -216,6 +242,7 @@ class AnchoredAbsoluteEEFStep(ProcessorStep):
         return {
             "enabled": self.enabled,
             "eef_starts": list(self.eef_starts),
+            "relative_scalars": self.relative_scalars,
             "n_action_steps": self.n_action_steps,
         }
 
