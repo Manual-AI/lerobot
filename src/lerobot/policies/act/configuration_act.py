@@ -119,10 +119,13 @@ class ACTConfig(PreTrainedConfig):
     temporal_ensemble_coeff: float | None = None
 
     # Chunk-anchored relative EEF actions. Each 9-dim xyz+rot6d block starts at
-    # one entry in relative_eef_starts; remaining dimensions use scalar offsets.
-    # Dataset action statistics must be computed over these deltas.
+    # one entry in relative_eef_starts; remaining dimensions are governed by relative_scalars below.
+    # Dataset action statistics must be computed over the resulting action representation.
     relative_actions: bool = False
     relative_eef_starts: list[int] = field(default_factory=list)
+    # Non-pose action dims (e.g. finger joints): True = chunk-anchored elementwise offsets from state,
+    # False = absolute values passed through. Only read when relative_actions is set.
+    relative_scalars: bool = True
 
     # Training and loss computation.
     dropout: float = 0.1
