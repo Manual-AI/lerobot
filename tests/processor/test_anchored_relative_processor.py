@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+
 import pytest
 import torch
 
@@ -100,6 +102,35 @@ def test_delta_compose_round_trip(with_time: bool):
     torch.testing.assert_close(recovered, actions, atol=1e-4, rtol=1e-4)
 
 
+@pytest.mark.parametrize("relative_scalars", [True, False])
+def test_delta_compose_round_trip_relative_scalars(relative_scalars: bool):
+    state = torch.cat([random_pose9(3, seed=24), torch.randn(3, 8)], dim=-1)
+    actions = torch.cat([random_pose9(3, 5, seed=25), torch.randn(3, 5, 8)], dim=-1)
+
+    delta = anchored_delta(actions, state, [0], relative_scalars)
+    recovered = anchored_compose(delta, state, [0], relative_scalars)
+
+    assert recovered.shape == actions.shape
+    torch.testing.assert_close(recovered, actions, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("with_time", [False, True])
+def test_anchored_delta_relative_scalars_false_passes_scalars_through(with_time: bool):
+    state = torch.cat([random_pose9(2, seed=26), torch.randn(2, 8)], dim=-1)
+    if with_time:
+        actions = torch.cat([random_pose9(2, 4, seed=27), torch.randn(2, 4, 8)], dim=-1)
+    else:
+        actions = torch.cat([random_pose9(2, seed=27), torch.randn(2, 8)], dim=-1)
+    actions_before = actions.clone()
+
+    delta_absolute = anchored_delta(actions, state, [0], relative_scalars=False)
+    delta_relative = anchored_delta(actions, state, [0], relative_scalars=True)
+
+    assert torch.equal(delta_absolute[..., 9:], actions[..., 9:])
+    torch.testing.assert_close(delta_absolute[..., :9], delta_relative[..., :9])
+    torch.testing.assert_close(actions, actions_before)
+
+
 def test_world_frame_invariance():
     state = random_pose9(2, seed=5)
     actions = random_pose9(2, 4, seed=6)
@@ -145,14 +176,17 @@ def test_invalid_layout_raises():
         anchored_delta(torch.zeros(2, 17), torch.zeros(2, 17), [9])
 
 
-def test_pre_step_converts_training_chunk():
+@pytest.mark.parametrize("relative_scalars", [True, False])
+def test_pre_step_converts_training_chunk(relative_scalars: bool):
     state = torch.cat([random_pose9(2, seed=10), torch.randn(2, 8)], dim=-1)
     actions = torch.cat([random_pose9(2, 5, seed=11), torch.randn(2, 5, 8)], dim=-1)
-    step = AnchoredRelativeEEFStep(enabled=True, eef_starts=[0])
+    step = AnchoredRelativeEEFStep(enabled=True, eef_starts=[0], relative_scalars=relative_scalars)
 
     output = step(_transition(state=state, action=actions))
 
-    torch.testing.assert_close(output[TransitionKey.ACTION], anchored_delta(actions, state, [0]))
+    torch.testing.assert_close(
+        output[TransitionKey.ACTION], anchored_delta(actions, state, [0], relative_scalars)
+    )
     assert step._last_state is state
 
 
@@ -167,10 +201,15 @@ def test_pre_step_disabled_still_caches_state():
     assert step._last_state is state
 
 
-def test_post_step_freezes_anchor_per_chunk():
-    pre_step = AnchoredRelativeEEFStep(enabled=True, eef_starts=[0])
+@pytest.mark.parametrize("relative_scalars", [True, False])
+def test_post_step_freezes_anchor_per_chunk(relative_scalars: bool):
+    pre_step = AnchoredRelativeEEFStep(enabled=True, eef_starts=[0], relative_scalars=relative_scalars)
     post_step = AnchoredAbsoluteEEFStep(
-        enabled=True, eef_starts=[0], n_action_steps=3, relative_step=pre_step
+        enabled=True,
+        eef_starts=[0],
+        relative_scalars=relative_scalars,
+        n_action_steps=3,
+        relative_step=pre_step,
     )
     anchor_a = torch.cat([random_pose9(1, seed=14), torch.randn(1, 8)], dim=-1)
     anchor_b = torch.cat([random_pose9(1, seed=15), torch.randn(1, 8)], dim=-1)
@@ -185,15 +224,15 @@ def test_post_step_freezes_anchor_per_chunk():
     pre_step(_transition(state=anchor_b))
     fourth = post_step(_transition(action=delta))[TransitionKey.ACTION]
 
-    torch.testing.assert_close(first, anchored_compose(delta, anchor_a, [0]))
+    torch.testing.assert_close(first, anchored_compose(delta, anchor_a, [0], relative_scalars))
     torch.testing.assert_close(second, first)
     torch.testing.assert_close(third, first)
-    torch.testing.assert_close(fourth, anchored_compose(delta, anchor_b, [0]))
+    torch.testing.assert_close(fourth, anchored_compose(delta, anchor_b, [0], relative_scalars))
 
     post_step.reset()
     pre_step(_transition(state=anchor_a))
     reset_output = post_step(_transition(action=delta))[TransitionKey.ACTION]
-    torch.testing.assert_close(reset_output, anchored_compose(delta, anchor_a, [0]))
+    torch.testing.assert_close(reset_output, anchored_compose(delta, anchor_a, [0], relative_scalars))
 
 
 def test_post_step_chunk_path_uses_latest_state():
@@ -237,6 +276,8 @@ def test_act_pipeline_wiring():
     assert absolute_step.enabled
     assert absolute_step.n_action_steps == 5
     assert absolute_step.relative_step is relative_step
+    assert relative_step.get_config()["relative_scalars"] is True
+    assert absolute_step.get_config()["relative_scalars"] is True
     assert preprocessor.steps.index(relative_step) < next(
         index for index, step in enumerate(preprocessor.steps) if isinstance(step, NormalizerProcessorStep)
     )
@@ -292,5 +333,170 @@ def test_reconnect_after_save_load(tmp_path):
 
     relative_step = next(
         step for step in loaded_preprocessor.steps if isinstance(step, AnchoredRelativeEEFStep)
+    )
+    assert absolute_step.relative_step is relative_step
+
+
+def _save_and_reload_anchored_processors(save_dir, config):
+    from lerobot.policies.act.processor_act import make_act_pre_post_processors
+
+    preprocessor, postprocessor = make_act_pre_post_processors(config, dataset_stats=None)
+    preprocessor.save_pretrained(save_dir)
+    postprocessor.save_pretrained(save_dir)
+    loaded_preprocessor = PolicyProcessorPipeline.from_pretrained(
+        save_dir, config_filename=f"{preprocessor.name}.json"
+    )
+    loaded_postprocessor = PolicyProcessorPipeline.from_pretrained(
+        save_dir,
+        config_filename=f"{postprocessor.name}.json",
+        to_transition=policy_action_to_transition,
+        to_output=transition_to_policy_action,
+    )
+    return loaded_preprocessor, loaded_postprocessor
+
+
+def test_reconnect_after_save_load_preserves_relative_scalars_false(tmp_path):
+    from lerobot.policies.act.configuration_act import ACTConfig
+    from lerobot.policies.factory import _reconnect_relative_absolute_steps
+
+    config = ACTConfig(
+        chunk_size=5,
+        n_action_steps=5,
+        relative_actions=True,
+        relative_eef_starts=[0],
+        relative_scalars=False,
+    )
+    loaded_preprocessor, loaded_postprocessor = _save_and_reload_anchored_processors(tmp_path, config)
+
+    relative_step = next(
+        step for step in loaded_preprocessor.steps if isinstance(step, AnchoredRelativeEEFStep)
+    )
+    absolute_step = next(
+        step for step in loaded_postprocessor.steps if isinstance(step, AnchoredAbsoluteEEFStep)
+    )
+    assert relative_step.relative_scalars is False
+    assert absolute_step.relative_scalars is False
+
+    _reconnect_relative_absolute_steps(loaded_preprocessor, loaded_postprocessor)
+
+    assert absolute_step.relative_step is relative_step
+
+
+def test_processor_config_without_relative_scalars_key_defaults_true(tmp_path):
+    """Mirrors the on-disk shape of a real mc.5 `policy_postprocessor.json`
+
+    (act_egg2_tempo_relative), saved before `relative_scalars` existed: it must still
+    load and decode with `relative_scalars=True`.
+    """
+    postprocessor_config = {
+        "name": "policy_postprocessor",
+        "steps": [
+            {
+                "registry_name": "unnormalizer_processor",
+                "config": {
+                    "eps": 1e-08,
+                    "features": {"action": {"type": "ACTION", "shape": [17]}},
+                    "norm_map": {"VISUAL": "MEAN_STD", "STATE": "MEAN_STD", "ACTION": "MEAN_STD"},
+                },
+            },
+            {
+                "registry_name": "anchored_absolute_eef_processor",
+                "config": {"enabled": True, "eef_starts": [0], "n_action_steps": 50},
+            },
+            {
+                "registry_name": "device_processor",
+                "config": {"device": "cpu", "float_dtype": None},
+            },
+        ],
+    }
+    config_path = tmp_path / "policy_postprocessor.json"
+    config_path.write_text(json.dumps(postprocessor_config))
+
+    loaded_postprocessor = PolicyProcessorPipeline.from_pretrained(
+        tmp_path,
+        config_filename="policy_postprocessor.json",
+        to_transition=policy_action_to_transition,
+        to_output=transition_to_policy_action,
+    )
+
+    absolute_step = next(
+        step for step in loaded_postprocessor.steps if isinstance(step, AnchoredAbsoluteEEFStep)
+    )
+    assert absolute_step.enabled is True
+    assert absolute_step.eef_starts == [0]
+    assert absolute_step.n_action_steps == 50
+    assert absolute_step.relative_scalars is True
+
+
+def test_reconnect_raises_on_relative_scalars_mismatch(tmp_path):
+    from lerobot.policies.act.configuration_act import ACTConfig
+    from lerobot.policies.factory import _reconnect_relative_absolute_steps
+
+    base_kwargs = {
+        "chunk_size": 5,
+        "n_action_steps": 5,
+        "relative_actions": True,
+        "relative_eef_starts": [0],
+    }
+    loaded_preprocessor, _ = _save_and_reload_anchored_processors(
+        tmp_path / "true", ACTConfig(relative_scalars=True, **base_kwargs)
+    )
+    _, loaded_postprocessor = _save_and_reload_anchored_processors(
+        tmp_path / "false", ACTConfig(relative_scalars=False, **base_kwargs)
+    )
+
+    with pytest.raises(ValueError, match="Mismatched anchored relative/absolute EEF processor configs"):
+        _reconnect_relative_absolute_steps(loaded_preprocessor, loaded_postprocessor)
+
+
+def test_reconnect_raises_on_eef_starts_mismatch(tmp_path):
+    from lerobot.policies.act.configuration_act import ACTConfig
+    from lerobot.policies.factory import _reconnect_relative_absolute_steps
+
+    base_kwargs = {
+        "chunk_size": 5,
+        "n_action_steps": 5,
+        "relative_actions": True,
+    }
+    loaded_preprocessor, _ = _save_and_reload_anchored_processors(
+        tmp_path / "starts_0", ACTConfig(relative_eef_starts=[0], **base_kwargs)
+    )
+    _, loaded_postprocessor = _save_and_reload_anchored_processors(
+        tmp_path / "starts_8", ACTConfig(relative_eef_starts=[8], **base_kwargs)
+    )
+
+    with pytest.raises(ValueError, match="Mismatched anchored relative/absolute EEF processor configs"):
+        _reconnect_relative_absolute_steps(loaded_preprocessor, loaded_postprocessor)
+
+
+def test_reconnect_raises_on_enabled_mismatch(tmp_path):
+    from lerobot.policies.act.configuration_act import ACTConfig
+    from lerobot.policies.factory import _reconnect_relative_absolute_steps
+
+    config = ACTConfig(chunk_size=5, n_action_steps=5, relative_actions=True, relative_eef_starts=[0])
+    loaded_preprocessor, loaded_postprocessor = _save_and_reload_anchored_processors(tmp_path, config)
+    absolute_step = next(
+        step for step in loaded_postprocessor.steps if isinstance(step, AnchoredAbsoluteEEFStep)
+    )
+    absolute_step.enabled = False  # simulate a hand-edited processor JSON
+
+    with pytest.raises(ValueError, match="Mismatched anchored relative/absolute EEF processor configs"):
+        _reconnect_relative_absolute_steps(loaded_preprocessor, loaded_postprocessor)
+
+
+def test_reconnect_does_not_raise_on_matched_pair(tmp_path):
+    from lerobot.policies.act.configuration_act import ACTConfig
+    from lerobot.policies.factory import _reconnect_relative_absolute_steps
+
+    config = ACTConfig(chunk_size=5, n_action_steps=5, relative_actions=True, relative_eef_starts=[0])
+    loaded_preprocessor, loaded_postprocessor = _save_and_reload_anchored_processors(tmp_path, config)
+
+    _reconnect_relative_absolute_steps(loaded_preprocessor, loaded_postprocessor)
+
+    relative_step = next(
+        step for step in loaded_preprocessor.steps if isinstance(step, AnchoredRelativeEEFStep)
+    )
+    absolute_step = next(
+        step for step in loaded_postprocessor.steps if isinstance(step, AnchoredAbsoluteEEFStep)
     )
     assert absolute_step.relative_step is relative_step

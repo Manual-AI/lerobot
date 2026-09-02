@@ -55,10 +55,15 @@ def make_act_pre_post_processors(
         return make_default_pre_post_processors(config, dataset_stats, normalizer_device=config.device)
 
     steps = make_default_policy_processor_steps(config, dataset_stats, normalizer_device=config.device)
-    relative_step = AnchoredRelativeEEFStep(enabled=True, eef_starts=list(config.relative_eef_starts))
+    relative_step = AnchoredRelativeEEFStep(
+        enabled=True,
+        eef_starts=list(config.relative_eef_starts),
+        relative_scalars=config.relative_scalars,
+    )
     absolute_step = AnchoredAbsoluteEEFStep(
         enabled=True,
         eef_starts=list(config.relative_eef_starts),
+        relative_scalars=config.relative_scalars,
         n_action_steps=config.n_action_steps,
         relative_step=relative_step,
     )
