@@ -136,8 +136,15 @@ class ACTPolicy(PreTrainedPolicy):
         actions = self.model(batch)[0]
         return actions
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
-        """Run the batch through the model and compute the loss for training or validation."""
+    def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
+        """Run the batch through the model and compute the loss for training or validation.
+
+        Args:
+            batch: Training batch containing observations and actions.
+            reduction: How to reduce the loss. Options:
+                - "mean": Return scalar mean loss (default, backward compatible)
+                - "none": Return per-sample losses of shape (batch_size,) for RA-BC weighting
+        """
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
@@ -146,6 +153,27 @@ class ACTPolicy(PreTrainedPolicy):
 
         abs_err = F.l1_loss(batch[ACTION], actions_hat, reduction="none")
         valid_mask = ~batch["action_is_pad"].unsqueeze(-1)
+
+        if reduction == "none":
+            # Per-sample (B,) mean L1 over time+action dims, masked by action_is_pad -- same
+            # arithmetic as the scalar path below, just not collapsed across the batch dim too.
+            per_sample_valid_steps = valid_mask.squeeze(-1).sum(dim=1)
+            per_sample_num_valid = (per_sample_valid_steps * abs_err.shape[-1]).clamp_min(1)
+            per_sample_l1 = (abs_err * valid_mask).sum(dim=(1, 2)) / per_sample_num_valid
+
+            loss_dict = {"l1_loss": per_sample_l1.mean().item()}
+            if self.config.use_vae and log_sigma_x2_hat is not None:
+                # Per-sample KL: sum over the latent dim only, keep the batch dim (see the "mean"
+                # branch below for the collapsed-to-scalar version of the same computation).
+                per_sample_kld = (
+                    -0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())
+                ).sum(-1)
+                loss_dict["kld_loss"] = per_sample_kld.mean().item()
+                per_sample_loss = per_sample_l1 + per_sample_kld * self.config.kl_weight
+            else:
+                per_sample_loss = per_sample_l1
+            return per_sample_loss, loss_dict
+
         num_valid = valid_mask.sum() * abs_err.shape[-1]
         l1_loss = (abs_err * valid_mask).sum() / num_valid.clamp_min(1)
 
