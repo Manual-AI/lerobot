@@ -14,10 +14,21 @@
 
 """Chunk-anchored relative EEF actions for flat xyz+rot6d action blocks.
 
-Each pose in a predicted chunk is expressed against the observation pose from
-which the chunk was predicted: ``delta_k = inverse(T_state) @ T_k``. Scalar
-action dimensions are represented by an elementwise offset from state when
-``relative_scalars`` is set, otherwise they pass through unchanged (absolute).
+Each pose in a predicted chunk is expressed against an anchor pose, selected by
+``relative_anchor``:
+
+* ``"state"`` (default): ``delta_k = inverse(T_state) @ T_k``, the observation
+  pose the chunk was predicted from.
+* ``"first_action"``: ``delta_k = inverse(T_action[0]) @ T_k``, DexUMI's native
+  convention — the chunk's own first action, so step 0 is exactly identity.
+
+Scalar action dimensions are represented by an elementwise offset from the same
+anchor when ``relative_scalars`` is set, otherwise they pass through unchanged
+(absolute).
+
+Decoding (``anchored_compose``) always composes back onto the measured
+``observation.state``, regardless of ``relative_anchor`` — see that function's
+docstring for why.
 
 The rot6d convention is the first two rows of the rotation matrix, flattened.
 """
@@ -71,6 +82,14 @@ def hom_inverse(hom: Tensor) -> Tensor:
     return inverse
 
 
+RELATIVE_ANCHORS = ("state", "first_action")
+
+
+def _validate_anchor(anchor: str) -> None:
+    if anchor not in RELATIVE_ANCHORS:
+        raise ValueError(f"relative_anchor must be one of {RELATIVE_ANCHORS}, got {anchor!r}.")
+
+
 def _validate_inputs(actions: Tensor, state: Tensor, eef_starts: Sequence[int]) -> None:
     if actions.ndim not in (2, 3):
         raise ValueError(f"actions must have shape (B, D) or (B, T, D), got {tuple(actions.shape)}.")
@@ -95,7 +114,11 @@ def _validate_inputs(actions: Tensor, state: Tensor, eef_starts: Sequence[int]) 
 
 
 def anchored_delta(
-    actions: Tensor, state: Tensor, eef_starts: Sequence[int], relative_scalars: bool = True
+    actions: Tensor,
+    state: Tensor,
+    eef_starts: Sequence[int],
+    relative_scalars: bool = True,
+    anchor: str = "state",
 ) -> Tensor:
     """Convert absolute actions to chunk-anchored relative actions.
 
@@ -103,19 +126,32 @@ def anchored_delta(
     ``(B, Ds)``. Pose blocks use SE(3) composition. All other dimensions use
     elementwise subtraction when ``relative_scalars`` is set, otherwise they
     pass through unchanged. SE(3) calculations use float64 internally.
+
+    ``anchor`` selects the pose the chunk is expressed against: ``"state"`` uses
+    ``state`` (the fork's original default); ``"first_action"`` uses the chunk's own
+    first action, ``actions[:, 0, :]`` (DexUMI's convention), and ignores ``state``.
     """
     _validate_inputs(actions, state, eef_starts)
+    _validate_anchor(anchor)
     squeeze_time = actions.ndim == 2
+    if anchor == "first_action" and squeeze_time:
+        raise ValueError(
+            "relative_anchor='first_action' requires a chunk of actions (actions.ndim == 3); "
+            f"got unbatched actions with shape {tuple(actions.shape)}, which has no first action "
+            "to anchor on."
+        )
     actions_with_time = actions.unsqueeze(1) if squeeze_time else actions
     state = state.to(device=actions.device, dtype=actions.dtype)
     action_dim = actions.shape[-1]
+    anchor_tensor = actions_with_time[:, 0, :] if anchor == "first_action" else state[:, :action_dim]
 
-    if relative_scalars:
-        result = actions_with_time - state[:, None, :action_dim]
-    else:
-        result = actions_with_time.clone()  # fresh tensor: the pose writes below are in place
+    # result must never alias actions_with_time: anchor_tensor is a view into
+    # actions_with_time (when anchor == "first_action") and is read again inside
+    # the loop below, after result has already been written into. Both branches
+    # here allocate a fresh tensor (subtraction and .clone() both copy).
+    result = actions_with_time - anchor_tensor[:, None, :] if relative_scalars else actions_with_time.clone()
     for start in eef_starts:
-        anchor_inverse = hom_inverse(pose9_to_hom(state[:, start : start + 9].double()))
+        anchor_inverse = hom_inverse(pose9_to_hom(anchor_tensor[:, start : start + 9].double()))
         absolute = pose9_to_hom(actions_with_time[:, :, start : start + 9].double())
         result[:, :, start : start + 9] = hom_to_pose9(anchor_inverse[:, None] @ absolute).to(result.dtype)
     return result.squeeze(1) if squeeze_time else result
@@ -128,6 +164,11 @@ def anchored_compose(
 
     Pose blocks use SE(3) composition. All other dimensions are added back onto
     ``state`` when ``relative_scalars`` is set, otherwise they pass through unchanged.
+
+    Decode always composes onto ``state`` regardless of which ``relative_anchor``
+    produced the deltas: under ``"state"`` that anchor is the measured pose by
+    definition, and under ``"first_action"`` the measured pose stands in for the
+    chunk's first target -- the one-frame mismatch DexUMI's own inference accepts.
     """
     _validate_inputs(actions, state, eef_starts)
     squeeze_time = actions.ndim == 2
@@ -140,9 +181,9 @@ def anchored_compose(
     else:
         result = actions_with_time.clone()  # fresh tensor: the pose writes below are in place
     for start in eef_starts:
-        anchor = pose9_to_hom(state[:, start : start + 9].double())
+        anchor_hom = pose9_to_hom(state[:, start : start + 9].double())
         relative = pose9_to_hom(actions_with_time[:, :, start : start + 9].double())
-        result[:, :, start : start + 9] = hom_to_pose9(anchor[:, None] @ relative).to(result.dtype)
+        result[:, :, start : start + 9] = hom_to_pose9(anchor_hom[:, None] @ relative).to(result.dtype)
     return result.squeeze(1) if squeeze_time else result
 
 
@@ -154,7 +195,11 @@ class AnchoredRelativeEEFStep(ProcessorStep):
     enabled: bool = False
     eef_starts: list[int] = field(default_factory=list)
     relative_scalars: bool = True
+    relative_anchor: str = "state"
     _last_state: Tensor | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        _validate_anchor(self.relative_anchor)
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         observation = transition.get(TransitionKey.OBSERVATION, {})
@@ -171,7 +216,7 @@ class AnchoredRelativeEEFStep(ProcessorStep):
 
         new_transition = transition.copy()
         new_transition[TransitionKey.ACTION] = anchored_delta(
-            action, state, self.eef_starts, self.relative_scalars
+            action, state, self.eef_starts, self.relative_scalars, self.relative_anchor
         )
         return new_transition
 
@@ -180,6 +225,7 @@ class AnchoredRelativeEEFStep(ProcessorStep):
             "enabled": self.enabled,
             "eef_starts": list(self.eef_starts),
             "relative_scalars": self.relative_scalars,
+            "relative_anchor": self.relative_anchor,
         }
 
     def transform_features(
@@ -197,6 +243,10 @@ class AnchoredAbsoluteEEFStep(ProcessorStep):
     eef_starts: list[int] = field(default_factory=list)
     n_action_steps: int = 1
     relative_scalars: bool = True
+    # Provenance and pre/post parity only (get_config, factory's mismatch check): decode
+    # never reads it -- see anchored_compose. Making decode branch on it would compose
+    # every chunk onto ~identity instead of the measured pose.
+    relative_anchor: str = "state"
     relative_step: AnchoredRelativeEEFStep | None = field(default=None, repr=False)
     _anchor: Tensor | None = field(default=None, init=False, repr=False)
     _ticks: int = field(default=0, init=False, repr=False)
@@ -204,6 +254,7 @@ class AnchoredAbsoluteEEFStep(ProcessorStep):
     def __post_init__(self) -> None:
         if self.n_action_steps < 1:
             raise ValueError(f"n_action_steps must be at least 1, got {self.n_action_steps}.")
+        _validate_anchor(self.relative_anchor)
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         if not self.enabled:
@@ -244,6 +295,7 @@ class AnchoredAbsoluteEEFStep(ProcessorStep):
             "eef_starts": list(self.eef_starts),
             "relative_scalars": self.relative_scalars,
             "n_action_steps": self.n_action_steps,
+            "relative_anchor": self.relative_anchor,
         }
 
     def transform_features(

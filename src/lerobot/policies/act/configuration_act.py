@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 
 from lerobot.configs import NormalizationMode, PreTrainedConfig
 from lerobot.optim import AdamWConfig
+from lerobot.processor.anchored_relative_processor import _validate_anchor
 
 
 @PreTrainedConfig.register_subclass("act")
@@ -126,6 +127,9 @@ class ACTConfig(PreTrainedConfig):
     # Non-pose action dims (e.g. finger joints): True = chunk-anchored elementwise offsets from state,
     # False = absolute values passed through. Only read when relative_actions is set.
     relative_scalars: bool = True
+    # Anchor pose the chunk's relative targets are expressed against: "state" (default) or
+    # "first_action" (DexUMI's native convention). Only read when relative_actions is set.
+    relative_anchor: str = "state"
 
     # Training and loss computation.
     dropout: float = 0.1
@@ -152,12 +156,13 @@ class ACTConfig(PreTrainedConfig):
         if self.relative_actions and self.temporal_ensemble_coeff is not None:
             raise ValueError(
                 "relative_actions is incompatible with temporal ensembling because the ensembler "
-                "would combine deltas expressed against different observation anchors."
+                "would combine deltas expressed against different per-chunk anchors."
             )
         if self.relative_actions:
             for start in self.relative_eef_starts:
                 if start < 0:
                     raise ValueError(f"relative_eef_starts must be non-negative, got {start}.")
+            _validate_anchor(self.relative_anchor)
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "

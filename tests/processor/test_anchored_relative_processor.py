@@ -449,6 +449,27 @@ def test_reconnect_raises_on_relative_scalars_mismatch(tmp_path):
         _reconnect_relative_absolute_steps(loaded_preprocessor, loaded_postprocessor)
 
 
+def test_reconnect_raises_on_relative_anchor_mismatch(tmp_path):
+    from lerobot.policies.act.configuration_act import ACTConfig
+    from lerobot.policies.factory import _reconnect_relative_absolute_steps
+
+    base_kwargs = {
+        "chunk_size": 5,
+        "n_action_steps": 5,
+        "relative_actions": True,
+        "relative_eef_starts": [0],
+    }
+    loaded_preprocessor, _ = _save_and_reload_anchored_processors(
+        tmp_path / "state", ACTConfig(relative_anchor="state", **base_kwargs)
+    )
+    _, loaded_postprocessor = _save_and_reload_anchored_processors(
+        tmp_path / "first_action", ACTConfig(relative_anchor="first_action", **base_kwargs)
+    )
+
+    with pytest.raises(ValueError, match="Mismatched anchored relative/absolute EEF processor configs"):
+        _reconnect_relative_absolute_steps(loaded_preprocessor, loaded_postprocessor)
+
+
 def test_reconnect_raises_on_eef_starts_mismatch(tmp_path):
     from lerobot.policies.act.configuration_act import ACTConfig
     from lerobot.policies.factory import _reconnect_relative_absolute_steps
@@ -482,6 +503,189 @@ def test_reconnect_raises_on_enabled_mismatch(tmp_path):
 
     with pytest.raises(ValueError, match="Mismatched anchored relative/absolute EEF processor configs"):
         _reconnect_relative_absolute_steps(loaded_preprocessor, loaded_postprocessor)
+
+
+def test_first_action_anchor_makes_step_zero_identity():
+    state = torch.cat([random_pose9(2, seed=30), torch.randn(2, 8)], dim=-1)
+    actions = torch.cat([random_pose9(2, 4, seed=31), torch.randn(2, 4, 8)], dim=-1)
+
+    delta_abs_scalars = anchored_delta(actions, state, [0], relative_scalars=False, anchor="first_action")
+    delta_rel_scalars = anchored_delta(actions, state, [0], relative_scalars=True, anchor="first_action")
+
+    torch.testing.assert_close(delta_abs_scalars[:, 0, :9], IDENTITY_POSE9.expand(2, 9), atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(delta_rel_scalars[:, 0, :9], IDENTITY_POSE9.expand(2, 9), atol=1e-5, rtol=1e-5)
+    # relative_scalars=False: step-0 scalars pass through absolute, unchanged.
+    torch.testing.assert_close(delta_abs_scalars[:, 0, 9:], actions[:, 0, 9:])
+    # relative_scalars=True: step-0 scalars are offsets from themselves, so zero.
+    torch.testing.assert_close(delta_rel_scalars[:, 0, 9:], torch.zeros(2, 8), atol=1e-6, rtol=0)
+
+
+def test_first_action_anchor_matches_state_anchor_when_state_equals_first_action():
+    """The equivalence the existing cube300 checkpoints exploited by accident.
+
+    When observation.state happens to equal the chunk's first action (the
+    unshifted-action bug this plan's Part A fixes), the two anchor conventions
+    must agree exactly.
+    """
+    first_action = torch.cat([random_pose9(2, seed=32), torch.randn(2, 8)], dim=-1)
+    rest = torch.cat([random_pose9(2, 3, seed=33), torch.randn(2, 3, 8)], dim=-1)
+    actions = torch.cat([first_action.unsqueeze(1), rest], dim=1)
+    state = first_action
+
+    delta_state_anchor = anchored_delta(actions, state, [0], anchor="state")
+    delta_first_action_anchor = anchored_delta(actions, state, [0], anchor="first_action")
+
+    torch.testing.assert_close(delta_state_anchor, delta_first_action_anchor, atol=1e-5, rtol=1e-5)
+
+
+def test_first_action_delta_composes_back_onto_first_action():
+    state = torch.cat([random_pose9(3, seed=34), torch.randn(3, 8)], dim=-1)
+    actions = torch.cat([random_pose9(3, 5, seed=35), torch.randn(3, 5, 8)], dim=-1)
+    first_action = actions[:, 0, :]
+
+    delta = anchored_delta(actions, state, [0], anchor="first_action")
+    recovered = anchored_compose(delta, first_action, [0])
+
+    assert recovered.shape == actions.shape
+    torch.testing.assert_close(recovered, actions, atol=1e-4, rtol=1e-4)
+
+
+def test_first_action_anchor_rejects_unbatched_actions():
+    state = torch.cat([random_pose9(2, seed=36), torch.randn(2, 8)], dim=-1)
+    actions = torch.cat([random_pose9(2, seed=37), torch.randn(2, 8)], dim=-1)  # (B, D): no chunk
+
+    with pytest.raises(ValueError, match="relative_anchor='first_action'"):
+        anchored_delta(actions, state, [0], anchor="first_action")
+
+
+def test_absolute_step_decode_is_anchor_inert():
+    """Decode must compose onto the measured state identically for both relative_anchor
+    values. A "fix" that made AnchoredAbsoluteEEFStep branch on relative_anchor would make
+    every "first_action" rollout compose onto ~identity instead of the measured EE pose --
+    on the rig, an arm commanded toward the origin. Pin the decoded output bit-identical
+    across both anchors, at the step level, to kill that mutation.
+    """
+    state = torch.cat([random_pose9(1, seed=40), torch.randn(1, 8)], dim=-1)
+    action = torch.cat([random_pose9(1, seed=41), torch.randn(1, 8)], dim=-1)
+
+    outputs = {}
+    for anchor in ("state", "first_action"):
+        pre_step = AnchoredRelativeEEFStep(enabled=True, eef_starts=[0], relative_anchor=anchor)
+        post_step = AnchoredAbsoluteEEFStep(
+            enabled=True,
+            eef_starts=[0],
+            n_action_steps=1,
+            relative_anchor=anchor,
+            relative_step=pre_step,
+        )
+        pre_step(_transition(state=state))
+        outputs[anchor] = post_step(_transition(action=action))[TransitionKey.ACTION]
+
+    assert torch.equal(outputs["state"], outputs["first_action"])
+
+
+def test_relative_anchor_round_trips_through_get_config_and_missing_key_defaults_to_state(tmp_path):
+    from lerobot.policies.act.configuration_act import ACTConfig
+    from lerobot.policies.act.processor_act import make_act_pre_post_processors
+
+    config = ACTConfig(
+        chunk_size=5,
+        n_action_steps=5,
+        relative_actions=True,
+        relative_eef_starts=[0],
+        relative_anchor="first_action",
+    )
+    preprocessor, postprocessor = make_act_pre_post_processors(config, dataset_stats=None)
+    relative_step = next(s for s in preprocessor.steps if isinstance(s, AnchoredRelativeEEFStep))
+    absolute_step = next(s for s in postprocessor.steps if isinstance(s, AnchoredAbsoluteEEFStep))
+    assert relative_step.get_config()["relative_anchor"] == "first_action"
+    assert absolute_step.get_config()["relative_anchor"] == "first_action"
+
+    preprocessor.save_pretrained(tmp_path)
+    postprocessor.save_pretrained(tmp_path)
+    loaded_preprocessor = PolicyProcessorPipeline.from_pretrained(
+        tmp_path, config_filename=f"{preprocessor.name}.json"
+    )
+    loaded_postprocessor = PolicyProcessorPipeline.from_pretrained(
+        tmp_path,
+        config_filename=f"{postprocessor.name}.json",
+        to_transition=policy_action_to_transition,
+        to_output=transition_to_policy_action,
+    )
+    loaded_relative_step = next(
+        s for s in loaded_preprocessor.steps if isinstance(s, AnchoredRelativeEEFStep)
+    )
+    loaded_absolute_step = next(
+        s for s in loaded_postprocessor.steps if isinstance(s, AnchoredAbsoluteEEFStep)
+    )
+    assert loaded_relative_step.relative_anchor == "first_action"
+    assert loaded_absolute_step.relative_anchor == "first_action"
+
+    # A real mc.6 policy_postprocessor.json, saved before relative_anchor existed: the
+    # missing key must default to "state" so the checkpoint decodes exactly as trained.
+    legacy_postprocessor_config = {
+        "name": "policy_postprocessor",
+        "steps": [
+            {
+                "registry_name": "anchored_absolute_eef_processor",
+                "config": {"enabled": True, "eef_starts": [0], "n_action_steps": 50},
+            },
+        ],
+    }
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    (legacy_dir / "policy_postprocessor.json").write_text(json.dumps(legacy_postprocessor_config))
+    legacy_postprocessor = PolicyProcessorPipeline.from_pretrained(
+        legacy_dir,
+        config_filename="policy_postprocessor.json",
+        to_transition=policy_action_to_transition,
+        to_output=transition_to_policy_action,
+    )
+    legacy_absolute_step = next(
+        s for s in legacy_postprocessor.steps if isinstance(s, AnchoredAbsoluteEEFStep)
+    )
+    assert legacy_absolute_step.relative_anchor == "state"
+
+
+def test_make_act_processors_thread_relative_anchor():
+    from lerobot.policies.act.configuration_act import ACTConfig
+    from lerobot.policies.act.processor_act import make_act_pre_post_processors
+
+    config = ACTConfig(
+        chunk_size=5,
+        n_action_steps=5,
+        relative_actions=True,
+        relative_eef_starts=[0],
+        relative_anchor="first_action",
+    )
+
+    preprocessor, postprocessor = make_act_pre_post_processors(config, dataset_stats=None)
+
+    relative_step = next(step for step in preprocessor.steps if isinstance(step, AnchoredRelativeEEFStep))
+    absolute_step = next(step for step in postprocessor.steps if isinstance(step, AnchoredAbsoluteEEFStep))
+    assert relative_step.relative_anchor == "first_action"
+    assert absolute_step.relative_anchor == "first_action"
+
+
+def test_act_config_relative_anchor_default_is_state():
+    """Pins the backward-compat default: existing relative checkpoints' processor JSON has
+    no relative_anchor key, and a missing key must decode exactly as trained (see
+    test_relative_anchor_round_trips_through_get_config_and_missing_key_defaults_to_state).
+    """
+    from lerobot.policies.act.configuration_act import ACTConfig
+
+    assert ACTConfig(relative_actions=True, relative_eef_starts=[0]).relative_anchor == "state"
+
+
+def test_invalid_relative_anchor_rejected():
+    from lerobot.policies.act.configuration_act import ACTConfig
+
+    with pytest.raises(ValueError, match="relative_anchor"):
+        AnchoredRelativeEEFStep(enabled=True, eef_starts=[0], relative_anchor="bogus")
+    with pytest.raises(ValueError, match="relative_anchor"):
+        AnchoredAbsoluteEEFStep(enabled=True, eef_starts=[0], relative_anchor="bogus")
+    with pytest.raises(ValueError, match="relative_anchor"):
+        ACTConfig(relative_actions=True, relative_eef_starts=[0], relative_anchor="bogus")
 
 
 def test_reconnect_does_not_raise_on_matched_pair(tmp_path):
