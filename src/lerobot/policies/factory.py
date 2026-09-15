@@ -86,15 +86,18 @@ def _reconnect_relative_absolute_steps(
                     step.enabled != anchored_relative_step.enabled
                     or list(step.eef_starts) != list(anchored_relative_step.eef_starts)
                     or step.relative_scalars != anchored_relative_step.relative_scalars
+                    or step.relative_anchor != anchored_relative_step.relative_anchor
                 ):
                     raise ValueError(
                         "Mismatched anchored relative/absolute EEF processor configs: "
                         f"preprocessor step has enabled={anchored_relative_step.enabled}, "
                         f"eef_starts={anchored_relative_step.eef_starts}, "
-                        f"relative_scalars={anchored_relative_step.relative_scalars}; "
+                        f"relative_scalars={anchored_relative_step.relative_scalars}, "
+                        f"relative_anchor={anchored_relative_step.relative_anchor}; "
                         f"postprocessor step has enabled={step.enabled}, "
                         f"eef_starts={step.eef_starts}, "
-                        f"relative_scalars={step.relative_scalars}."
+                        f"relative_scalars={step.relative_scalars}, "
+                        f"relative_anchor={step.relative_anchor}."
                     )
                 step.relative_step = anchored_relative_step
 
