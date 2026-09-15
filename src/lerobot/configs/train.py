@@ -284,6 +284,21 @@ class TrainPipelineConfig(HubMixin):
             )
 
         active_cfg = self.trainable_config
+        # StreamingLeRobotDataset does not have an episode-aware sampler, so it
+        # cannot discard anchors whose requested future actions cross an episode
+        # boundary or require tail padding. Map-style ACT training uses
+        # ACTConfig.drop_n_last_frames for that exact filtering.
+        if (
+            self.dataset.streaming
+            and active_cfg.type == "act"
+            and max(active_cfg.action_delta_indices or [0]) > 0
+        ):
+            raise ValueError(
+                "ACT with dataset.streaming=True requires all action_delta_indices to be 0. "
+                "Streaming datasets cannot exclude incomplete future-action windows at episode "
+                "boundaries; set dataset.streaming=False or use chunk_size=1 and "
+                "action_delta_offset=0."
+            )
         if self.rename_map and active_cfg.pretrained_path is None:
             raise ValueError(
                 "`rename_map` requires a pretrained policy checkpoint. "
