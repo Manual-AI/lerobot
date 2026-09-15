@@ -59,11 +59,13 @@ def make_act_pre_post_processors(
         enabled=True,
         eef_starts=list(config.relative_eef_starts),
         relative_scalars=config.relative_scalars,
+        relative_anchor=config.relative_anchor,
     )
     absolute_step = AnchoredAbsoluteEEFStep(
         enabled=True,
         eef_starts=list(config.relative_eef_starts),
         relative_scalars=config.relative_scalars,
+        relative_anchor=config.relative_anchor,
         n_action_steps=config.n_action_steps,
         relative_step=relative_step,
     )
