@@ -85,6 +85,9 @@ class ACTConfig(PreTrainedConfig):
     n_obs_steps: int = 1
     chunk_size: int = 100
     n_action_steps: int = 100
+    # Training target window offset relative to the observation at t. An offset of
+    # one makes the chunk supervise action[t + 1 : t + 1 + chunk_size].
+    action_delta_offset: int = 0
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -168,6 +171,15 @@ class ACTConfig(PreTrainedConfig):
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
                 f"{self.n_action_steps} for `n_action_steps` and {self.chunk_size} for `chunk_size`."
             )
+        if isinstance(self.action_delta_offset, bool) or not isinstance(self.action_delta_offset, int):
+            raise ValueError(
+                f"action_delta_offset must be a non-negative integer, got {self.action_delta_offset!r}."
+            )
+        if self.action_delta_offset < 0:
+            raise ValueError(
+                "action_delta_offset cannot be negative: the action chunk cannot start before "
+                "the observation it is conditioned on."
+            )
         if self.n_obs_steps != 1:
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
@@ -191,8 +203,15 @@ class ACTConfig(PreTrainedConfig):
         return None
 
     @property
-    def action_delta_indices(self) -> list:
-        return list(range(self.chunk_size))
+    def action_delta_indices(self) -> list[int]:
+        """Return the complete action target window selected for each observation."""
+        return list(range(self.action_delta_offset, self.action_delta_offset + self.chunk_size))
+
+    @property
+    def drop_n_last_frames(self) -> int:
+        """Exclude anchors whose target action window would run past an episode end."""
+        indices = self.action_delta_indices
+        return max(indices) if indices else 0
 
     @property
     def reward_delta_indices(self) -> None:
