@@ -51,6 +51,30 @@ And outputs a chunk of `k` future action sequences.
 
 ## Training ACT
 
+### Relative end-effector action normalization
+
+With `--policy.relative_actions=true`, `lerobot-train` computes action normalization
+statistics from the selected training episodes after the train/eval split. Every training
+chunk is converted with the configured `relative_eef_starts`, `relative_scalars`, and
+`relative_anchor`. Padded actions are excluded. Mean/std, min/max, and quantile statistics
+are pooled per action dimension across valid chunk positions; overlapping chunks contribute
+separately because they can have different anchors. Observation/image statistics are unchanged.
+
+This adds one statistics pass before a new training or fine-tuning run. The parquet reader
+reads only action/state/index columns, without decoding images or video. Other storage
+readers use their normal item-loading path. Automatic relative statistics require a finite,
+non-streaming dataset. Fresh fine-tuning rebuilds processors from the active ACT settings;
+it does not reuse the source checkpoint's action statistics.
+
+The resulting statistics are saved in the preprocessor and postprocessor `.safetensors`
+files alongside the checkpoint. Resume and inference load those saved values without
+recomputing them or needing the training dataset at inference. Existing checkpoints retain
+their original statistics; do not replace an existing checkpoint's statistics independently
+of training. This computation is part of `lerobot-train`; custom training loops must supply
+matching relative-action statistics when constructing ACT processors.
+
+### Training command
+
 ACT works seamlessly with the standard LeRobot training pipeline. Here's a complete example for training ACT on your dataset:
 
 ```bash
