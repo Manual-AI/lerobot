@@ -98,27 +98,6 @@ def test_inference_snapshot_keeps_cursor_and_both_tails_row_aligned():
     torch.testing.assert_close(snapshot.processed_left_over, processed[1:])
 
 
-def test_rtc_merge_returns_the_exact_atomic_seam():
-    queue = ActionQueue(RTCConfig(enabled=True, execution_horizon=4))
-    outgoing = torch.tensor([[0.0], [1.0], [2.0]])
-    queue.merge(outgoing, outgoing, real_delay=0)
-    queue.get()
-
-    incoming = torch.tensor([[10.0], [11.0], [12.0]])
-    result = queue.merge(incoming, incoming, real_delay=1)
-
-    assert result is not None
-    torch.testing.assert_close(result.previous_action, torch.tensor([1.0]))
-    torch.testing.assert_close(result.next_action, torch.tensor([11.0]))
-
-
-def test_append_merge_has_no_replacement_seam():
-    queue = ActionQueue(RTCConfig(enabled=False, execution_horizon=4))
-    actions = torch.zeros(3, 1)
-
-    assert queue.merge(actions, actions, real_delay=0) is None
-
-
 # get() tests
 
 

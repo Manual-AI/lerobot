@@ -35,9 +35,7 @@ import torch
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.rtc import (
     ActionQueue,
-    ActionQueueMergeResult,
     ActionQueueSnapshot,
-    ChunkSeamTracker,
     LatencyTracker,
     RelativeRTCPrefixEncoder,
     reanchor_relative_rtc_prefix,
@@ -243,8 +241,6 @@ class RTCInferenceEngine(InferenceEngine):
                 compile_warmup_inferences,
             )
 
-        self._seam_tracker = ChunkSeamTracker()
-
         # Processor introspection for relative-action re-anchoring.
         self._relative_step = next(
             (s for s in preprocessor.steps if isinstance(s, RelativeActionsProcessorStep) and s.enabled),
@@ -337,10 +333,6 @@ class RTCInferenceEngine(InferenceEngine):
             else:
                 logger.info("RTC inference thread stopped")
                 self._rtc_thread = None
-        # Normal shutdown has joined the sole writer, so this is a final rather
-        # than a racing snapshot. If the worker failed to join, defer the summary.
-        if self._rtc_thread is None or not self._rtc_thread.is_alive():
-            self._log_chunk_seam_summary()
 
     def pause(self) -> None:
         """Pause the RTC background thread."""
@@ -364,8 +356,6 @@ class RTCInferenceEngine(InferenceEngine):
         # Invalidate the data-plane state first. An in-flight inference may finish,
         # but its epoch check will reject the result before it can reach the robot.
         with self._obs_lock:
-            self._log_chunk_seam_summary()
-            self._seam_tracker.reset()
             if self._action_queue is not None:
                 self._action_queue.clear()
             self._obs_holder["obs"] = None
@@ -522,38 +512,6 @@ class RTCInferenceEngine(InferenceEngine):
                 )
             encoded = encoded.squeeze(0)
         return encoded.to(policy_device)
-
-    def _record_chunk_seam(self, merge_result: ActionQueueMergeResult | None) -> None:
-        """Measure the commanded-action jump this chunk swap will cause.
-
-        ``ActionQueue.merge`` captures both actions under the queue lock, so this
-        measurement describes the actual atomic replacement rather than a nearby
-        preview. Appended (non-RTC) chunks return no merge result.
-        """
-        if merge_result is None:
-            return
-        gap = self._seam_tracker.record(merge_result.previous_action, merge_result.next_action)
-        if gap is not None:
-            logger.debug("RTC chunk seam discontinuity: max_abs=%.5f", gap)
-
-    def _log_chunk_seam_summary(self) -> None:
-        """Log aggregate chunk-boundary continuity for this rollout."""
-        if len(self._seam_tracker) == 0:
-            return
-        summary = self._seam_tracker.summary()
-        logger.info(
-            "RTC chunk seam continuity over %d boundaries: max_abs mean=%.5f p95=%.5f max=%.5f, l2 mean=%.5f",
-            int(summary["boundaries"]),
-            summary["max_abs_mean"],
-            summary["max_abs_p95"],
-            summary["max_abs_max"],
-            summary["l2_mean"],
-        )
-
-    @property
-    def seam_summary(self) -> dict[str, float]:
-        """Chunk-boundary discontinuity statistics in postprocessed action units."""
-        return self._seam_tracker.summary()
 
     def _rtc_loop(self) -> None:
         """Background thread that generates action chunks via RTC."""
@@ -721,16 +679,13 @@ class RTCInferenceEngine(InferenceEngine):
                             # a pre-reset chunk.  Lock order: _obs_lock -> queue.lock.
                             epoch_unchanged = epoch_before == self._reset_epoch
                             if epoch_unchanged:
-                                merge_result = queue.merge(
+                                queue.merge(
                                     original,
                                     processed,
                                     new_delay,
                                     idx_before,
                                     task=task,
                                 )
-                                # Still under _obs_lock: reset cannot clear the
-                                # tracker between the accepted merge and its seam.
-                                self._record_chunk_seam(merge_result)
                         if not epoch_unchanged:
                             logger.info("Discarding action chunk computed before an engine reset")
 

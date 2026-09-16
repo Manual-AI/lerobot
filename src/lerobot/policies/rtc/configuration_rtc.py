@@ -47,9 +47,8 @@ class RTCConfig:
     max_guidance_weight: float = 10.0
     execution_horizon: int = 10
     # Set to False to keep asynchronous chunk replacement but stop conditioning each chunk on
-    # the previous one's unexecuted tail. Latency hiding is unaffected; only seam continuity is.
-    # This is the ablation switch for measuring how much prefix guidance actually smooths
-    # chunk boundaries -- compare the logged seam statistics with it on and off.
+    # the previous one's unexecuted tail. This allows comparing guided and unguided
+    # chunk replacement while preserving asynchronous chunk production.
     prefix_guidance: bool = True
 
     # Debug settings

@@ -124,16 +124,6 @@ RTCConfig(execution_horizon=10)
 
 **`inference_delay`**: How many timesteps of inference latency your system has. This is passed to `predict_action_chunk()` rather than the config, since it may vary at runtime.
 
-## Measuring Chunk Continuity
-
-`lerobot-rollout` measures every chunk swap: it compares the action the outgoing chunk would have commanded next against the first action the incoming chunk actually commands, and logs the result in raw action units when the episode ends.
-
-```
-RTC chunk seam continuity over 42 boundaries: max_abs mean=0.61 p95=1.40 max=2.10, l2 mean=0.93
-```
-
-Lower is smoother. Compare configurations by running the same task and `execution_horizon` twice, once with `--inference.rtc.prefix_guidance=true` and once with `false`.
-
 ## Relative-Action Policies
 
 Policies trained with relative actions predict deltas against the observation they were predicted from, so the previous chunk's model-space output cannot be reused verbatim as the prefix — it is anchored to the previous observation. The rollout engine therefore takes the unexecuted tail in absolute coordinates and re-expresses it against the current observation before handing it to the policy.

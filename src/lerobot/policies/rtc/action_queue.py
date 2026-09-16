@@ -42,14 +42,6 @@ class ActionQueueSnapshot:
     processed_left_over: Tensor | None
 
 
-@dataclass(frozen=True)
-class ActionQueueMergeResult:
-    """The exact commanded-action transition made by an RTC queue replacement."""
-
-    previous_action: Tensor | None
-    next_action: Tensor | None
-
-
 class ActionQueue:
     """Thread-safe queue for managing action chunks in real-time control.
 
@@ -208,7 +200,7 @@ class ActionQueue:
         action_index_before_inference: int | None = None,
         *,
         task: str | None = None,
-    ) -> ActionQueueMergeResult | None:
+    ) -> None:
         """Merge new actions into the queue.
 
         This method operates differently based on RTC mode:
@@ -226,20 +218,10 @@ class ActionQueue:
             delay = self._check_and_resolve_delays(real_delay, action_index_before_inference)
 
             if self.cfg.enabled:
-                previous_action = None
-                if self.queue is not None and self.last_index < len(self.queue):
-                    previous_action = self.queue[self.last_index].clone()
                 self._replace_actions_queue(original_actions, processed_actions, delay, task)
-                next_action = None
-                if self.queue is not None and len(self.queue) > 0:
-                    next_action = self.queue[0].clone()
-                return ActionQueueMergeResult(
-                    previous_action=previous_action,
-                    next_action=next_action,
-                )
+                return
 
             self._append_actions_queue(original_actions, processed_actions, task)
-            return None
 
     def _replace_actions_queue(
         self,

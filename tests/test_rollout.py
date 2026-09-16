@@ -646,7 +646,7 @@ def test_create_inference_engine_sync():
 
 
 # ---------------------------------------------------------------------------
-# RTC engine: native relative-action prefix and chunk-seam measurement
+# RTC engine: native relative-action prefix and observation snapshots
 # ---------------------------------------------------------------------------
 
 
@@ -781,54 +781,6 @@ def test_rtc_observation_packet_keeps_the_pre_dispatch_queue_snapshot():
     torch.testing.assert_close(snapshot.original_left_over, original)
     torch.testing.assert_close(snapshot.processed_left_over, processed)
     assert queue.get_action_index() == 1
-
-
-def test_rtc_engine_measures_the_chunk_seam_at_the_delayed_row():
-    from lerobot.policies.rtc import ActionQueue
-    from lerobot.policies.rtc.configuration_rtc import RTCConfig
-
-    engine = _make_rtc_engine([])
-    queue = ActionQueue(RTCConfig(execution_horizon=4))
-    outgoing = torch.zeros(6, 2)
-    queue.merge(outgoing.clone(), outgoing.clone(), real_delay=0)
-    queue.get()
-
-    incoming = torch.tensor([[9.0, 9.0], [0.25, -0.5], [7.0, 7.0]])
-    merge_result = queue.merge(incoming.clone(), incoming, real_delay=1)
-    engine._record_chunk_seam(merge_result)
-
-    # Row 1 is what the robot executes first, so that is the row the seam compares.
-    summary = engine.seam_summary
-    assert summary["boundaries"] == 1.0
-    assert summary["max_abs_mean"] == 0.5
-
-
-def test_rtc_engine_reports_no_seam_before_the_first_chunk():
-    from lerobot.policies.rtc import ActionQueue
-    from lerobot.policies.rtc.configuration_rtc import RTCConfig
-
-    engine = _make_rtc_engine([])
-    queue = ActionQueue(RTCConfig(execution_horizon=4))
-
-    incoming = torch.ones(3, 2)
-    engine._record_chunk_seam(queue.merge(incoming.clone(), incoming, real_delay=0))
-
-    assert engine.seam_summary["boundaries"] == 0.0
-
-
-def test_rtc_engine_skips_seam_measurement_when_chunks_are_appended():
-    """With RTC disabled the queue appends instead of swapping, so there is no seam."""
-    from lerobot.policies.rtc import ActionQueue
-    from lerobot.policies.rtc.configuration_rtc import RTCConfig
-
-    engine = _make_rtc_engine([], enabled=False)
-    queue = ActionQueue(RTCConfig(enabled=False, execution_horizon=4))
-    queue.merge(torch.zeros(4, 2), torch.zeros(4, 2), real_delay=0)
-
-    incoming = torch.ones(3, 2)
-    engine._record_chunk_seam(queue.merge(incoming.clone(), incoming, real_delay=0))
-
-    assert engine.seam_summary["boundaries"] == 0.0
 
 
 def test_rtc_config_prefix_guidance_defaults_to_enabled():
