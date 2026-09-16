@@ -22,6 +22,7 @@ from typing import Any
 
 import torch
 from torch.utils.data import IterableDataset
+from tqdm.auto import tqdm
 
 from lerobot.datasets.compute_stats import RunningQuantileStats
 from lerobot.datasets.sampler import EpisodeAwareSampler
@@ -62,7 +63,7 @@ def _iter_training_chunks(
             reader.load_and_activate()
         frame_view = reader.hf_dataset.select_columns(["index", "episode_index", state_key])
 
-    indices = iter(sampler)
+    indices = iter(tqdm(sampler, desc="Computing ACT relative action statistics", unit="chunk"))
     while batch_indices := list(islice(indices, batch_size)):
         if frame_view is not None:
             frames = frame_view[batch_indices]
