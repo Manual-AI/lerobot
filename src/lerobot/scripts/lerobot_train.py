@@ -73,6 +73,8 @@ from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
 from lerobot.jobs import submit_to_hf
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
+from lerobot.policies.act.configuration_act import ACTConfig
+from lerobot.policies.act.relative_stats import resolve_act_training_processor_inputs
 from lerobot.policies.factory import ProcessorConfigKwargs
 from lerobot.processor.rename_processor import rename_batch_keys, rename_stats
 from lerobot.rewards import make_reward_pre_post_processors
@@ -506,7 +508,12 @@ def train(cfg: TrainPipelineConfig):
         processor_pretrained_path = None
 
     processor_kwargs = ProcessorConfigKwargs()
-    processor_dataset_stats = rename_stats(dataset.meta.stats, cfg.rename_map)
+    if isinstance(active_cfg, ACTConfig):
+        processor_pretrained_path, processor_dataset_stats = resolve_act_training_processor_inputs(
+            active_cfg, dataset, resume=cfg.resume, rename_map=cfg.rename_map
+        )
+    else:
+        processor_dataset_stats = rename_stats(dataset.meta.stats, cfg.rename_map)
     if (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path:
         processor_kwargs["dataset_stats"] = processor_dataset_stats
     if cfg.is_reward_model_training:
