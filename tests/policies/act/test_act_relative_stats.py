@@ -139,8 +139,11 @@ def _expected_targets(config, actions, states):
     # Independent SE(3) oracle, using a general matrix inverse rather than the
     # production rot6d/anchored_delta helpers. Never include padded or held-out rows.
     targets = []
+    # ACTConfig.drop_n_last_frames excludes anchors whose target window would run past
+    # the episode end, so the sampler never yields them and they are not expected here.
+    drop = getattr(config, "drop_n_last_frames", 0)
     for episode in ([0, 1, 2], [5]):
-        for position, frame in enumerate(episode):
+        for position, frame in enumerate(episode[: len(episode) - drop]):
             anchor = actions[frame] if config.relative_anchor == "first_action" else states[frame, :20]
             for target in episode[position : position + config.chunk_size]:
                 result = actions[target].copy()
@@ -166,7 +169,7 @@ def test_stats_match_independent_se3_oracle_and_selected_unpadded_training_targe
     stats = compute_act_relative_action_stats(config, dataset, batch_size=batch_size)
     targets = _expected_targets(config, actions, states)
 
-    assert stats["count"].item() == 7  # six targets from episode 0, one from episode 2
+    assert stats["count"].item() == targets.shape[0]
     for name, reducer in [("mean", np.mean), ("std", np.std), ("min", np.min), ("max", np.max)]:
         assert stats[name].shape == (20,)  # same stats across all chunk positions
         np.testing.assert_allclose(stats[name], reducer(targets, axis=0), atol=2e-6, rtol=1e-6)
@@ -284,7 +287,9 @@ def test_streaming_requires_saved_stats_on_resume(tmp_path):
 def test_generic_reader_excludes_padding_and_rejects_nonfinite_targets(tmp_path):
     config = ACTConfig(chunk_size=3, n_action_steps=3, relative_actions=True, device="cpu")
     meta = SimpleNamespace(
-        episodes={"dataset_from_index": [0], "dataset_to_index": [1]},
+        # Long enough to keep one anchor after drop_n_last_frames (chunk_size - 1 = 2);
+        # the stub reader returns the same padded item for whichever anchor is drawn.
+        episodes={"dataset_from_index": [0], "dataset_to_index": [3]},
         features={ACTION: {}, OBS_STATE: {}},
     )
     item = {
@@ -296,7 +301,7 @@ def test_generic_reader_excludes_padding_and_rejects_nonfinite_targets(tmp_path)
         _meta=meta,
         episodes=None,
         absolute_to_relative_idx=None,
-        num_frames=1,
+        num_frames=3,
         get_items=lambda indices: [item for _ in indices],
     )
     dataset = _Dataset(reader)
