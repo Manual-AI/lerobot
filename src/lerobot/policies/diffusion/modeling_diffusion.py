@@ -110,14 +110,31 @@ class DiffusionPolicy(PreTrainedPolicy):
         """
         queues_populated = any(len(q) > 0 for q in self._queues.values())
         if queues_populated:
-            batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
+            batch_processed = {}
+            for key in batch:
+                if key not in self._queues:
+                    continue
+                queue_items = list(self._queues[key])
+                if key == OBS_IMAGES and self.config.use_separate_rgb_encoder_per_camera:
+                    batch_processed[key] = [
+                        torch.stack([item[camera_index] for item in queue_items], dim=1)
+                        for camera_index in range(len(queue_items[0]))
+                    ]
+                else:
+                    batch_processed[key] = torch.stack(queue_items, dim=1)
+            batch = batch_processed
         else:
             batch = dict(batch)
             if self.config.image_features:
                 for key in self.config.image_features:
                     if batch[key].ndim == 4:
                         batch[key] = batch[key].unsqueeze(1)
-                batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+                if self.config.use_separate_rgb_encoder_per_camera:
+                    batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+                else:
+                    batch[OBS_IMAGES] = torch.stack(
+                        [batch[key] for key in self.config.image_features], dim=-4
+                    )
         actions = self.diffusion.generate_actions(batch, noise=noise)
         return actions
 
@@ -149,7 +166,12 @@ class DiffusionPolicy(PreTrainedPolicy):
 
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+            if self.config.use_separate_rgb_encoder_per_camera:
+                # Keep images separate when using separate encoders
+                batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+            else:
+                # Stack images when using shared encoder (requires same resolution)
+                batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
         # NOTE: It's important that this happens after stacking the images into a single key.
         self._queues = populate_queues(self._queues, batch)
 
@@ -167,7 +189,10 @@ class DiffusionPolicy(PreTrainedPolicy):
             for key in self.config.image_features:
                 if self.config.n_obs_steps == 1 and batch[key].ndim == 4:
                     batch[key] = batch[key].unsqueeze(1)
-            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+            if self.config.use_separate_rgb_encoder_per_camera:
+                batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+            else:
+                batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
         loss = self.diffusion.compute_loss(batch)
         # no output_dict so returning None
         return loss, None
@@ -198,7 +223,10 @@ class DiffusionModel(nn.Module):
         if self.config.image_features:
             num_images = len(self.config.image_features)
             if self.config.use_separate_rgb_encoder_per_camera:
-                encoders = [DiffusionRgbEncoder(config) for _ in range(num_images)]
+                encoders = [
+                    DiffusionRgbEncoder(config, image_shape=feature.shape)
+                    for feature in self.config.image_features.values()
+                ]
                 self.rgb_encoder = nn.ModuleList(encoders)
                 global_cond_dim += encoders[0].feature_dim * num_images
             else:
@@ -274,18 +302,14 @@ class DiffusionModel(nn.Module):
         # Extract image features.
         if self.config.image_features:
             if self.config.use_separate_rgb_encoder_per_camera:
-                # Combine batch and sequence dims while rearranging to make the camera index dimension first.
-                images_per_camera = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
-                img_features_list = torch.cat(
-                    [
-                        encoder(images)
-                        for encoder, images in zip(self.rgb_encoder, images_per_camera, strict=True)
-                    ]
-                )
-                # Separate batch and sequence dims back out. The camera index dim gets absorbed into the
-                # feature dim (effectively concatenating the camera features).
+                img_features_list = []
+                for encoder, camera_images in zip(self.rgb_encoder, batch[OBS_IMAGES], strict=True):
+                    camera_flat = einops.rearrange(camera_images, "b s ... -> (b s) ...")
+                    img_features_list.append(encoder(camera_flat))
+
+                img_features_concat = torch.cat(img_features_list, dim=-1)
                 img_features = einops.rearrange(
-                    img_features_list, "(n b s) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
+                    img_features_concat, "(b s) ... -> b s ...", b=batch_size, s=n_obs_steps
                 )
             else:
                 # Combine batch, sequence, and "which camera" dims before passing to shared encoder.
@@ -477,7 +501,7 @@ class DiffusionRgbEncoder(nn.Module):
     Includes the ability to normalize and crop the image first.
     """
 
-    def __init__(self, config: DiffusionConfig):
+    def __init__(self, config: DiffusionConfig, image_shape: tuple[int, ...] | None = None):
         super().__init__()
         # Set up optional preprocessing.
         if config.resize_shape is not None:
@@ -519,8 +543,7 @@ class DiffusionRgbEncoder(nn.Module):
         # Use a dry run to get the feature map shape.
         # The dummy shape mirrors the runtime preprocessing order: resize -> crop.
 
-        # Note: we have a check in the config class to make sure all images have the same shape.
-        images_shape = next(iter(config.image_features.values())).shape
+        images_shape = image_shape or next(iter(config.image_features.values())).shape
         if config.crop_shape is not None:
             dummy_shape_h_w = config.crop_shape
         elif config.resize_shape is not None:

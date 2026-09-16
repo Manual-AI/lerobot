@@ -1,0 +1,3 @@
+[submodule "src/lerobot/robots/dual_arm_robot/FTServo_Python"]
+	path = src/lerobot/robots/dual_arm_robot/FTServo_Python
+	url = https://github.com/ftservo/FTServo_Python.git

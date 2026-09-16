@@ -37,7 +37,7 @@ class DiffusionConfig(PreTrainedConfig):
               AND/OR
             - The key "observation.environment_state" is required as input.
         - If there are multiple keys beginning with "observation.image" they are treated as multiple camera
-          views. Right now we only support all images having the same shape.
+          views. Different shapes are supported when `use_separate_rgb_encoder_per_camera` is enabled.
         - "action" is required as an output key.
 
     Args:
@@ -239,7 +239,7 @@ class DiffusionConfig(PreTrainedConfig):
                     )
 
         # Check that all input images have the same shape.
-        if len(self.image_features) > 0:
+        if len(self.image_features) > 0 and not self.use_separate_rgb_encoder_per_camera:
             first_image_key, first_image_ft = next(iter(self.image_features.items()))
             for key, image_ft in self.image_features.items():
                 if image_ft.shape != first_image_ft.shape:
