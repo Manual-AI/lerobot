@@ -18,6 +18,7 @@
 
 import queue
 import threading
+import time
 
 import numpy as np
 import pytest
@@ -442,6 +443,63 @@ class TestStreamingVideoEncoder:
         # We can't guarantee drops but can verify no crash occurred
         assert dropped >= 0
 
+        encoder.close()
+
+    def _slow_queue_encoder(self, monkeypatch, tmp_path, block_when_full):
+        """An encoder whose thread takes each frame slower than feed_frame's 0.1 s put timeout."""
+        import lerobot.datasets.video_utils as video_utils
+
+        class SlowQueue(queue.Queue):
+            def get(self, *args, **kwargs):
+                item = super().get(*args, **kwargs)
+                time.sleep(0.15)
+                return item
+
+        monkeypatch.setattr(video_utils.queue, "Queue", SlowQueue)
+        encoder = StreamingVideoEncoder(
+            fps=30,
+            rgb_encoder=self._make_encoder_config(
+                vcodec="libsvtav1", pix_fmt="yuv420p", g=2, crf=30, preset=13
+            ),
+            queue_maxsize=1,
+            block_when_full=block_when_full,
+        )
+        encoder.start_episode([f"{OBS_IMAGES}.cam"], tmp_path)
+        return encoder
+
+    @pytest.mark.parametrize("block_when_full", [False, True])
+    def test_block_when_full_keeps_every_frame(self, monkeypatch, tmp_path, block_when_full):
+        """Blocking mode never drops; the default mode drops under the same backlog."""
+        encoder = self._slow_queue_encoder(monkeypatch, tmp_path, block_when_full)
+        num_frames = 8
+        for _ in range(num_frames):
+            frame = np.random.randint(0, 255, (64, 96, 3), dtype=np.uint8)
+            encoder.feed_frame(f"{OBS_IMAGES}.cam", frame)
+        mp4_path, _ = encoder.finish_episode()[f"{OBS_IMAGES}.cam"]
+        dropped = encoder._dropped_frames.get(f"{OBS_IMAGES}.cam", 0)
+
+        with av.open(str(mp4_path)) as container:
+            total_frames = sum(1 for _ in container.decode(container.streams.video[0]))
+
+        if block_when_full:
+            assert dropped == 0
+            assert total_frames == num_frames
+        else:
+            assert dropped > 0
+            assert total_frames == num_frames - dropped
+        encoder.close()
+
+    def test_block_when_full_raises_when_encoder_dies(self, monkeypatch, tmp_path):
+        """A dead encoder thread must not leave a blocked feed_frame waiting forever."""
+        encoder = self._slow_queue_encoder(monkeypatch, tmp_path, block_when_full=True)
+        key = f"{OBS_IMAGES}.cam"
+        frame = np.zeros((64, 96, 3), dtype=np.uint8)
+        encoder.feed_frame(key, frame)
+        encoder._stop_events[key].set()
+        encoder._threads[key].join(timeout=10)
+        with pytest.raises(RuntimeError, match="not alive|crashed"):
+            for _ in range(5):
+                encoder.feed_frame(key, frame)
         encoder.close()
 
 

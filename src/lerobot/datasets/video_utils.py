@@ -902,6 +902,7 @@ class StreamingVideoEncoder:
         depth_encoder: DepthEncoderConfig | None = None,
         queue_maxsize: int = 30,
         encoder_threads: int | None = None,
+        block_when_full: bool = False,
     ):
         """
         Args:
@@ -915,12 +916,18 @@ class StreamingVideoEncoder:
                 back-pressure drops frames.
             encoder_threads: Number of encoder threads (global setting).
                 ``None`` lets the codec decide.
+            block_when_full: If ``True``, a full queue blocks :meth:`feed_frame` until the
+                encoder catches up instead of dropping the frame. For offline conversion, where
+                the producer outruns real time and a dropped frame would silently desync the
+                video from the tabular rows. Leave ``False`` for live recording, where stalling
+                would stall the control loop.
         """
         self.fps = fps
         self._rgb_encoder = rgb_encoder or rgb_encoder_defaults()
         self._depth_encoder = depth_encoder or depth_encoder_defaults()
         self._encoder_threads = encoder_threads
         self.queue_maxsize = queue_maxsize
+        self.block_when_full = block_when_full
 
         self._frame_queues: dict[str, queue.Queue] = {}
         self._result_queues: dict[str, queue.Queue] = {}
@@ -984,7 +991,8 @@ class StreamingVideoEncoder:
         A copy of the image is made before enqueueing to prevent race conditions
         with camera drivers that may reuse buffers. If the encoder queue is full
         (encoder can't keep up), the frame is dropped with a warning instead of
-        crashing the recording session.
+        crashing the recording session -- unless ``block_when_full`` is set, in which
+        case this waits for room (raising if the encoder thread dies meanwhile).
 
         Args:
             video_key: The video feature key
@@ -996,6 +1004,30 @@ class StreamingVideoEncoder:
         if not self._episode_active:
             raise RuntimeError("No active episode. Call start_episode() first.")
 
+        self._raise_if_encoder_dead(video_key)
+
+        image = image.copy()
+        if self.block_when_full:
+            while True:
+                try:
+                    self._frame_queues[video_key].put(image, timeout=0.5)
+                    return
+                except queue.Full:
+                    self._raise_if_encoder_dead(video_key)
+
+        try:
+            self._frame_queues[video_key].put(image, timeout=0.1)
+        except queue.Full:
+            self._dropped_frames[video_key] = self._dropped_frames.get(video_key, 0) + 1
+            count = self._dropped_frames[video_key]
+            # Log periodically to avoid spam (1st, then every 10th)
+            if count == 1 or count % 10 == 0:
+                logger.warning(
+                    f"Encoder queue full for {video_key}, dropped {count} frame(s). "
+                    f"Consider using vcodec='auto' for hardware encoding or increasing encoder_queue_maxsize."
+                )
+
+    def _raise_if_encoder_dead(self, video_key: str) -> None:
         thread = self._threads[video_key]
         if not thread.is_alive():
             # Check for error
@@ -1006,18 +1038,6 @@ class StreamingVideoEncoder:
             except queue.Empty:
                 pass
             raise RuntimeError(f"Encoder thread for {video_key} is not alive")
-
-        try:
-            self._frame_queues[video_key].put(image.copy(), timeout=0.1)
-        except queue.Full:
-            self._dropped_frames[video_key] = self._dropped_frames.get(video_key, 0) + 1
-            count = self._dropped_frames[video_key]
-            # Log periodically to avoid spam (1st, then every 10th)
-            if count == 1 or count % 10 == 0:
-                logger.warning(
-                    f"Encoder queue full for {video_key}, dropped {count} frame(s). "
-                    f"Consider using vcodec='auto' for hardware encoding or increasing encoder_queue_maxsize."
-                )
 
     def finish_episode(self) -> dict[str, tuple[Path, dict | None]]:
         """Finish encoding the current episode.

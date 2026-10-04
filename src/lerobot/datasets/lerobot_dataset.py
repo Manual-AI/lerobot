@@ -74,6 +74,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         *,
         repo_type: str = "dataset",
         token: str | bool | None = None,
+        encoder_block_when_full: bool = False,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -207,6 +208,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 instead of writing PNG images first. This makes save_episode() near-instant. Defaults to False.
             encoder_queue_maxsize (int, optional): Maximum number of frames to buffer per camera when using
                 streaming encoding. Defaults to 30 (~1s at 30fps).
+            encoder_block_when_full (bool, optional): If ``True``, a full streaming-encoder queue blocks
+                ``add_frame`` instead of dropping the frame. For offline conversion; leave
+                ``False`` for live recording. Defaults to False.
             repo_type (str, optional): "dataset" (default) or "bucket" for an HF
                 Storage Bucket. With "bucket" and no ``root``, the dataset is read
                 in place from ``hf://buckets/{repo_id}`` (map-style access requires
@@ -338,6 +342,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
                     depth_encoder,
                     encoder_queue_maxsize,
                     encoder_threads,
+                    encoder_block_when_full,
                 )
             self.writer = DatasetWriter(
                 meta=self.meta,
@@ -404,6 +409,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         depth_encoder: DepthEncoderConfig | None,
         encoder_queue_maxsize: int,
         encoder_threads: int | None,
+        encoder_block_when_full: bool = False,
     ) -> StreamingVideoEncoder:
         return StreamingVideoEncoder(
             fps=fps,
@@ -411,6 +417,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             depth_encoder=depth_encoder,
             queue_maxsize=encoder_queue_maxsize,
             encoder_threads=encoder_threads,
+            block_when_full=encoder_block_when_full,
         )
 
     # ── Metadata properties ───────────────────────────────────────────
@@ -760,6 +767,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         encoder_threads: int | None = None,
         video_files_size_in_mb: int | None = None,
         data_files_size_in_mb: int | None = None,
+        encoder_block_when_full: bool = False,
     ) -> "LeRobotDataset":
         """Create a new LeRobotDataset from scratch for recording data.
 
@@ -796,6 +804,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 during capture instead of writing images first.
             encoder_queue_maxsize: Max buffered frames per camera when using
                 streaming encoding.
+            encoder_block_when_full: If ``True``, a full streaming-encoder queue blocks
+                ``add_frame`` instead of dropping the frame. For offline conversion; leave
+                ``False`` for live recording.
 
         Returns:
             A new :class:`LeRobotDataset` in write mode.
@@ -833,7 +844,12 @@ class LeRobotDataset(torch.utils.data.Dataset):
         streaming_enc = None
         if streaming_encoding and len(obj.meta.video_keys) > 0:
             streaming_enc = cls._build_streaming_encoder(
-                fps, rgb_encoder, depth_encoder, encoder_queue_maxsize, encoder_threads
+                fps,
+                rgb_encoder,
+                depth_encoder,
+                encoder_queue_maxsize,
+                encoder_threads,
+                encoder_block_when_full,
             )
         obj.writer = DatasetWriter(
             meta=obj.meta,
@@ -871,6 +887,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         encoder_queue_maxsize: int = 30,
         *,
         token: str | bool | None = None,
+        encoder_block_when_full: bool = False,
     ) -> "LeRobotDataset":
         """Resume recording on an existing dataset.
 
@@ -904,6 +921,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
             streaming_encoding: If ``True``, encode video in real-time during
                 capture.
             encoder_queue_maxsize: Max buffered frames per camera for streaming.
+            encoder_block_when_full: If ``True``, a full streaming-encoder queue blocks
+                ``add_frame`` instead of dropping the frame. For offline conversion; leave
+                ``False`` for live recording.
             token: Authentication token used if metadata must be downloaded
                 from the Hub. The token is not retained on the dataset instance.
 
@@ -951,7 +971,12 @@ class LeRobotDataset(torch.utils.data.Dataset):
         streaming_enc = None
         if streaming_encoding and len(obj.meta.video_keys) > 0:
             streaming_enc = cls._build_streaming_encoder(
-                obj.meta.fps, rgb_encoder, depth_encoder, encoder_queue_maxsize, encoder_threads
+                obj.meta.fps,
+                rgb_encoder,
+                depth_encoder,
+                encoder_queue_maxsize,
+                encoder_threads,
+                encoder_block_when_full,
             )
         obj.writer = DatasetWriter(
             meta=obj.meta,
