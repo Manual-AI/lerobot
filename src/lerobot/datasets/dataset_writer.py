@@ -39,6 +39,7 @@ from lerobot.configs import (
     infer_depth_unit,
     rgb_encoder_defaults,
 )
+from lerobot.utils.constants import DEFAULT_FEATURES
 
 from .compute_stats import compute_episode_stats
 from .dataset_metadata import LeRobotDatasetMetadata
@@ -268,13 +269,66 @@ class DatasetWriter:
 
         self.episode_buffer["size"] += 1
 
+    def add_episode(self, data: dict, tasks: list[str], videos: dict) -> None:
+        """Save a whole episode whose videos are already encoded.
+
+        Args:
+            data: Every non-video user feature, each an array with one row per frame.
+            tasks: The task string of every frame.
+            videos: ``{video_key: (mp4_path, stats)}`` for every video feature, one frame per
+                row, encoded with this dataset's encoder settings (e.g. by
+                :class:`~lerobot.datasets.video_utils.VideoFileEncoder`). The files are copied,
+                never moved or deleted.
+        """
+        if self.episode_buffer is not None and self.episode_buffer["size"] > 0:
+            raise RuntimeError("add_episode() with frames already added; save or clear them first")
+        if self._meta.image_keys:
+            raise NotImplementedError("add_episode() supports video features only, not image ones")
+        if self._batch_encoding_size > 1:
+            raise NotImplementedError("add_episode() cannot be combined with batched encoding")
+        n = len(tasks)
+        buffer = self._create_episode_buffer()
+        buffer["size"] = n
+        buffer["task"] = list(tasks)
+        buffer["frame_index"] = list(range(n))
+        buffer["timestamp"] = [i / self._meta.fps for i in range(n)]
+        for key, ft in self._meta.features.items():
+            if key in DEFAULT_FEATURES:
+                continue
+            if ft["dtype"] in ["image", "video"]:
+                buffer[key] = [None] * n
+                continue
+            if key not in data:
+                raise ValueError(f"add_episode(): feature {key!r} missing from data")
+            values = np.asarray(data[key])
+            shape = tuple(ft["shape"])
+            if len(values) != n or values.shape[1:] not in (shape, () if shape == (1,) else shape):
+                raise ValueError(f"add_episode(): {key!r} has shape {values.shape}, expected ({n}, *{shape})")
+            buffer[key] = list(values)
+        extra = set(data) - set(self._meta.features)
+        if extra:
+            raise ValueError(f"add_episode(): unknown features {sorted(extra)}")
+        self.save_episode(episode_data=buffer, videos=videos)
+        # The (empty) frame buffer was made for this episode's index; start the next one fresh.
+        self.episode_buffer = self._create_episode_buffer()
+
     def save_episode(
         self,
         episode_data: dict | None = None,
         parallel_encoding: bool = True,
+        videos: dict | None = None,
     ) -> None:
-        """Save the current episode in self.episode_buffer to disk."""
+        """Save the current episode in self.episode_buffer to disk.
+
+        ``videos`` (``{video_key: (mp4_path, stats)}``) supplies already-encoded videos instead
+        of encoding the buffered frames; see :meth:`add_episode`.
+        """
         episode_buffer = episode_data if episode_data is not None else self.episode_buffer
+        if videos is not None and set(videos) != set(self._meta.video_keys):
+            raise ValueError(
+                f"videos must cover exactly the video features {sorted(self._meta.video_keys)}, "
+                f"got {sorted(videos)}"
+            )
 
         validate_episode_buffer(episode_buffer, self._meta.total_episodes, self._meta.features)
 
@@ -309,10 +363,11 @@ class DatasetWriter:
         self._wait_image_writer()
 
         has_video_keys = len(self._meta.video_keys) > 0
-        use_streaming = self._streaming_encoder is not None and has_video_keys
+        use_prerecorded = videos is not None and has_video_keys
+        use_streaming = self._streaming_encoder is not None and has_video_keys and not use_prerecorded
         use_batched_encoding = self._batch_encoding_size > 1
 
-        if use_streaming:
+        if use_streaming or use_prerecorded:
             non_video_buffer = {
                 k: v
                 for k, v in episode_buffer.items()
@@ -325,7 +380,23 @@ class DatasetWriter:
 
         ep_metadata = self._save_episode_data(episode_buffer)
 
-        if use_streaming:
+        if use_prerecorded:
+            for video_key in self._meta.video_keys:
+                src, video_stats = videos[video_key]
+                # _save_episode_video moves its input and deletes the input's directory, so it
+                # gets a private copy: the caller's file is theirs to keep.
+                temp_path = Path(tempfile.mkdtemp(dir=self._root)) / Path(src).name
+                shutil.copyfile(src, temp_path)
+                if video_stats is not None:
+                    normalization_factor = 255.0 if video_key not in self._meta.depth_keys else 1.0
+                    ep_stats[video_key] = {
+                        k: v
+                        if k == "count"
+                        else np.squeeze(v.reshape(1, -1, 1, 1) / normalization_factor, axis=0)
+                        for k, v in video_stats.items()
+                    }
+                ep_metadata.update(self._save_episode_video(video_key, episode_index, temp_path=temp_path))
+        elif use_streaming:
             streaming_results = self._streaming_encoder.finish_episode()
             for video_key in self._meta.video_keys:
                 normalization_factor = 255.0 if video_key not in self._meta.depth_keys else 1.0
@@ -377,7 +448,7 @@ class DatasetWriter:
         # `meta.save_episode` need to be executed after encoding the videos
         self._meta.save_episode(episode_index, episode_length, episode_tasks, ep_stats, ep_metadata)
 
-        if has_video_keys and use_batched_encoding:
+        if has_video_keys and use_batched_encoding and not use_prerecorded:
             self._episodes_since_last_encoding += 1
             if self._episodes_since_last_encoding == self._batch_encoding_size:
                 start_ep = self._meta.total_episodes - self._batch_encoding_size

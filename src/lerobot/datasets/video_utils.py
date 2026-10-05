@@ -783,16 +783,10 @@ class _CameraEncoderThread(threading.Thread):
         self.encoder_threads = encoder_threads
 
     def run(self) -> None:
-        from .compute_stats import RunningQuantileStats, auto_downsample_height_width
-
-        container = None
-        output_stream = None
-        stats_tracker = RunningQuantileStats()
-        frame_count = 0
-
+        encoder = VideoFileEncoder(
+            self.video_path, self.fps, self.video_encoder, encoder_threads=self.encoder_threads
+        )
         try:
-            logging.getLogger("libav").setLevel(av.logging.WARNING)
-
             while True:
                 try:
                     frame_data = self.frame_queue.get(timeout=1)
@@ -804,83 +798,126 @@ class _CameraEncoderThread(threading.Thread):
                 if frame_data is None:
                     # Sentinel: flush and close
                     break
+                encoder.add(frame_data)
 
-                # Ensure HWC (RGB or depth) uint8 (RGB only) numpy array
-                if isinstance(frame_data, np.ndarray):
-                    if frame_data.ndim == 3 and frame_data.shape[0] in (1, 3):
-                        # CHW -> HWC
-                        frame_data = frame_data.transpose(1, 2, 0)
-                    if not self.is_depth and frame_data.dtype != np.uint8:
-                        frame_data = (frame_data * 255).astype(np.uint8)
-
-                # Open container on first frame (to get width/height)
-                if container is None:
-                    height, width = frame_data.shape[:2]
-                    Path(self.video_path).parent.mkdir(parents=True, exist_ok=True)
-                    container = av.open(str(self.video_path), "w")
-                    output_stream = container.add_stream(
-                        self.video_encoder.vcodec,
-                        self.fps,
-                        options=self.video_encoder.get_codec_options(self.encoder_threads, as_strings=True),
-                    )
-                    output_stream.pix_fmt = self.video_encoder.pix_fmt
-                    output_stream.width = width
-                    output_stream.height = height
-                    output_stream.time_base = Fraction(1, self.fps)
-
-                # Encode frame with explicit timestamps
-                if not self.is_depth:
-                    pil_img = Image.fromarray(frame_data)
-                    video_frame = av.VideoFrame.from_image(pil_img)
-                else:
-                    video_frame = quantize_depth(
-                        frame_data,
-                        depth_min=self.video_encoder.depth_min,
-                        depth_max=self.video_encoder.depth_max,
-                        shift=self.video_encoder.shift,
-                        use_log=self.video_encoder.use_log,
-                        video_backend=self.video_encoder.video_backend,
-                    )
-                video_frame.pts = frame_count
-                video_frame.time_base = Fraction(1, self.fps)
-                packet = output_stream.encode(video_frame)
-                if packet:
-                    container.mux(packet)
-
-                # Update stats with downsampled frame (per-channel stats like compute_episode_stats)
-                img_chw = frame_data.transpose(2, 0, 1)  # HWC -> CHW
-                img_downsampled = auto_downsample_height_width(img_chw)
-                # Reshape CHW to (H*W, C) for per-channel stats
-                channels = img_downsampled.shape[0]
-                img_for_stats = img_downsampled.transpose(1, 2, 0).reshape(-1, channels)
-                stats_tracker.update(img_for_stats)
-
-                frame_count += 1
-
-            # Flush encoder
-            if output_stream is not None:
-                packet = output_stream.encode()
-                if packet:
-                    container.mux(packet)
-
-            if container is not None:
-                container.close()
-
-            av.logging.restore_default_callback()
-
-            # Get stats and put on result queue
-            if frame_count >= 2:
-                stats = stats_tracker.get_statistics()
-                self.result_queue.put(("ok", stats))
-            else:
-                self.result_queue.put(("ok", None))
+            self.result_queue.put(("ok", encoder.close()))
 
         except Exception as e:
             logger.error(f"Encoder thread error: {e}")
-            if container is not None:
-                with contextlib.suppress(Exception):
-                    container.close()
+            encoder.abort()
             self.result_queue.put(("error", str(e)))
+
+
+class VideoFileEncoder:
+    """Encode frames, one at a time, into a video file while accumulating per-channel stats.
+
+    The encoding half of :class:`StreamingVideoEncoder`'s per-camera thread, usable on its own:
+    it applies backpressure naturally (``add`` returns once the frame is encoded), so offline
+    producers never drop frames. The output and stats are identical to the streaming path's, so
+    the result can be handed to ``LeRobotDataset.add_episode(videos=...)``.
+
+    Args:
+        video_path: Output video file.
+        fps: Frame rate of the output video.
+        video_encoder: RGB or depth encoder settings.
+        encoder_threads: Codec thread count; ``None`` lets the codec decide.
+    """
+
+    def __init__(
+        self,
+        video_path: Path,
+        fps: int,
+        video_encoder: VideoEncoderConfig,
+        encoder_threads: int | None = None,
+    ):
+        from .compute_stats import RunningQuantileStats
+
+        self.video_path = Path(video_path)
+        self.fps = fps
+        self.video_encoder = video_encoder
+        self.is_depth = isinstance(video_encoder, DepthEncoderConfig)
+        self.encoder_threads = encoder_threads
+        self.frame_count = 0
+        self._container = None
+        self._stream = None
+        self._stats = RunningQuantileStats()
+        logging.getLogger("libav").setLevel(av.logging.WARNING)
+
+    def add(self, frame_data) -> None:
+        """Encode one HWC (or CHW) frame: uint8 RGB, or float in [0, 1], or depth."""
+        from .compute_stats import auto_downsample_height_width
+
+        # Ensure HWC (RGB or depth) uint8 (RGB only) numpy array
+        if isinstance(frame_data, np.ndarray):
+            if frame_data.ndim == 3 and frame_data.shape[0] in (1, 3):
+                # CHW -> HWC
+                frame_data = frame_data.transpose(1, 2, 0)
+            if not self.is_depth and frame_data.dtype != np.uint8:
+                frame_data = (frame_data * 255).astype(np.uint8)
+
+        # Open container on first frame (to get width/height)
+        if self._container is None:
+            height, width = frame_data.shape[:2]
+            self.video_path.parent.mkdir(parents=True, exist_ok=True)
+            self._container = av.open(str(self.video_path), "w")
+            self._stream = self._container.add_stream(
+                self.video_encoder.vcodec,
+                self.fps,
+                options=self.video_encoder.get_codec_options(self.encoder_threads, as_strings=True),
+            )
+            self._stream.pix_fmt = self.video_encoder.pix_fmt
+            self._stream.width = width
+            self._stream.height = height
+            self._stream.time_base = Fraction(1, self.fps)
+
+        # Encode frame with explicit timestamps
+        if not self.is_depth:
+            pil_img = Image.fromarray(frame_data)
+            video_frame = av.VideoFrame.from_image(pil_img)
+        else:
+            video_frame = quantize_depth(
+                frame_data,
+                depth_min=self.video_encoder.depth_min,
+                depth_max=self.video_encoder.depth_max,
+                shift=self.video_encoder.shift,
+                use_log=self.video_encoder.use_log,
+                video_backend=self.video_encoder.video_backend,
+            )
+        video_frame.pts = self.frame_count
+        video_frame.time_base = Fraction(1, self.fps)
+        packet = self._stream.encode(video_frame)
+        if packet:
+            self._container.mux(packet)
+
+        # Update stats with downsampled frame (per-channel stats like compute_episode_stats)
+        img_chw = frame_data.transpose(2, 0, 1)  # HWC -> CHW
+        img_downsampled = auto_downsample_height_width(img_chw)
+        # Reshape CHW to (H*W, C) for per-channel stats
+        channels = img_downsampled.shape[0]
+        img_for_stats = img_downsampled.transpose(1, 2, 0).reshape(-1, channels)
+        self._stats.update(img_for_stats)
+
+        self.frame_count += 1
+
+    def close(self) -> dict | None:
+        """Flush and close the file. Returns the frames' stats, or ``None`` below two frames."""
+        if self._stream is not None:
+            packet = self._stream.encode()
+            if packet:
+                self._container.mux(packet)
+        if self._container is not None:
+            self._container.close()
+            self._container = None
+
+        av.logging.restore_default_callback()
+        return self._stats.get_statistics() if self.frame_count >= 2 else None
+
+    def abort(self) -> None:
+        """Close the file after an error, without flushing."""
+        if self._container is not None:
+            with contextlib.suppress(Exception):
+                self._container.close()
+            self._container = None
 
 
 class StreamingVideoEncoder:
