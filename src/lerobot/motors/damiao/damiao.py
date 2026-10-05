@@ -17,7 +17,9 @@
 # https://github.com/cmjang/DM_Control_Python
 
 import logging
+import math
 import time
+from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, TypedDict
@@ -63,6 +65,21 @@ MEDIUM_TIMEOUT_SEC = 0.01
 SHORT_TIMEOUT_SEC = 0.001
 PRECISE_TIMEOUT_SEC = 0.0001
 
+# Default bounded wait for this tick's refresh replies, after the queue has been drained (settable
+# per bus as `state_wait_s`). The replies to N refreshes need about 2 * N * 130 us on classic 1 Mbps
+# CAN, so 2 ms is tight for 7-8 motors there; a reply that misses it is reported with its true age.
+STATE_WAIT_S = 0.002
+# Max frames consumed by one drain phase, so a flooded bus can't stall a tick.
+DRAIN_CAP = 4096
+# Max wall time of the non-blocking pre-send drain (GIL contention can make each recv slow).
+DRAIN_MAX_S = 0.005
+# A reply's rx timestamp may precede the host's send timestamp by this much (clock granularity).
+FRESH_EPS_S = 0.0005
+# An rx timestamp further than this from `time.time()` is not epoch time; host receipt time is used.
+PLAUSIBLE_TS_SKEW_S = 10.0
+# Minimum interval between repeats of one kind of warning on one bus.
+STALE_WARN_INTERVAL_S = 1.0
+
 
 class MotorState(TypedDict):
     position: float
@@ -70,6 +87,9 @@ class MotorState(TypedDict):
     torque: float
     temp_mos: float
     temp_rotor: float
+    # Kernel rx time of the frame this state was decoded from, in epoch seconds
+    # (`can.Message.timestamp`); 0.0 until the motor has replied once.
+    timestamp: float
 
 
 class DamiaoMotorsBus(MotorsBusBase):
@@ -142,9 +162,19 @@ class DamiaoMotorsBus(MotorsBusBase):
                 "torque": 0.0,
                 "temp_mos": 0.0,
                 "temp_rotor": 0.0,
+                "timestamp": 0.0,
             }
             for name in self.motors
         }
+
+        # Age (s) above which a reading is reported as stale; owners may set it to e.g. 2 / fps.
+        self.stale_warn_s: float = 2 / 30
+        # Bounded wait (s) for refresh replies in `sync_read_all_states` / `sync_read` / `read`.
+        self.state_wait_s: float = STATE_WAIT_S
+        # Per motor: refreshes whose reply missed the wait window (state fell back to an older reading).
+        self.refresh_miss_count: dict[str, int] = dict.fromkeys(self.motors, 0)
+        self._last_warn: dict[str, float] = {}
+        self._warned_host_ts = False
 
         # Dynamic gains storage
         # Defaults: Kp=10.0 (Stiffness), Kd=0.5 (Damping)
@@ -198,6 +228,12 @@ class DamiaoMotorsBus(MotorsBusBase):
             logger.debug(f"{self.__class__.__name__} connected via {self.can_interface}.")
         except Exception as e:
             self._is_connected = False
+            if self.canbus is not None:
+                try:
+                    self.canbus.shutdown()
+                except Exception as shutdown_error:
+                    logger.debug(f"Error closing CAN bus after failed connect: {shutdown_error}")
+                self.canbus = None
             raise ConnectionError(f"Failed to connect to CAN bus: {e}") from e
 
     def _handshake(self) -> None:
@@ -207,36 +243,24 @@ class DamiaoMotorsBus(MotorsBusBase):
         """
         logger.info("Starting handshake with motors...")
 
-        # Drain any pending messages
-        if self.canbus is None:
+        bus = self.canbus
+        if bus is None:
             raise RuntimeError("CAN bus is not initialized.")
-
-        while self.canbus.recv(timeout=0.01):
-            pass
 
         missing_motors = []
         for motor_name in self.motors:
             motor_id = self._get_motor_id(motor_name)
             recv_id = self._get_motor_recv_id(motor_name)
 
-            # Send enable command
+            # Send enable command and wait (longer timeout) for a reply sent after it
             data = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, CAN_CMD_ENABLE]
             msg = can.Message(arbitration_id=motor_id, data=data, is_extended_id=False, is_fd=self.use_can_fd)
-            self.canbus.send(msg)
+            _, fresh = self._drain_newest([recv_id], send=lambda m=msg: bus.send(m), wait_s=LONG_TIMEOUT_SEC)
 
-            # Wait for response with longer timeout
-            response = None
-            start_time = time.time()
-            while time.time() - start_time < 0.1:
-                response = self.canbus.recv(timeout=0.1)
-                if response and response.arbitration_id == recv_id:
-                    break
-                response = None
-
-            if response is None:
-                missing_motors.append(motor_name)
+            if recv_id in fresh:
+                self._process_response(motor_name, fresh[recv_id])
             else:
-                self._process_response(motor_name, msg)
+                missing_motors.append(motor_name)
             time.sleep(MEDIUM_TIMEOUT_SEC)
 
         if missing_motors:
@@ -283,12 +307,13 @@ class DamiaoMotorsBus(MotorsBusBase):
         data = [0xFF] * 7 + [command_byte]
         msg = can.Message(arbitration_id=motor_id, data=data, is_extended_id=False, is_fd=self.use_can_fd)
 
-        if self.canbus is None:
+        bus = self.canbus
+        if bus is None:
             raise RuntimeError("CAN bus is not initialized.")
 
-        self.canbus.send(msg)
-        if msg := self._recv_motor_response(expected_recv_id=recv_id):
-            self._process_response(motor_name, msg)
+        _, fresh = self._drain_newest([recv_id], send=lambda: bus.send(msg), wait_s=SHORT_TIMEOUT_SEC)
+        if reply := fresh.get(recv_id):
+            self._process_response(motor_name, reply)
         else:
             logger.debug(f"No response from {motor_name} after command 0x{command_byte:02X}")
 
@@ -339,91 +364,140 @@ class DamiaoMotorsBus(MotorsBusBase):
             time.sleep(MEDIUM_TIMEOUT_SEC)
 
     def _refresh_motor(self, motor: NameOrID) -> can.Message | None:
-        """Refresh motor status and return the response."""
+        """Refresh one motor and return a fresh reply (see `_drain_newest`) within `state_wait_s`, else None.
+
+        Older frames still queued from that motor are drained and discarded, so a dead motor is never
+        masked by a stale frame.
+        """
         motor_id = self._get_motor_id(motor)
         recv_id = self._get_motor_recv_id(motor)
         data = [motor_id & 0xFF, (motor_id >> 8) & 0xFF, CAN_CMD_REFRESH, 0, 0, 0, 0, 0]
         msg = can.Message(arbitration_id=CAN_PARAM_ID, data=data, is_extended_id=False, is_fd=self.use_can_fd)
 
-        if self.canbus is None:
+        bus = self.canbus
+        if bus is None:
             raise RuntimeError("CAN bus is not initialized.")
 
-        self.canbus.send(msg)
-        return self._recv_motor_response(expected_recv_id=recv_id)
+        _, fresh = self._drain_newest([recv_id], send=lambda: bus.send(msg), wait_s=self.state_wait_s)
+        return fresh.get(recv_id)
 
-    def _recv_motor_response(
-        self, expected_recv_id: int | None = None, timeout: float = 0.001
-    ) -> can.Message | None:
+    def _drain_newest(
+        self,
+        expected_ids: Iterable[int],
+        send: Callable[[], None] | None = None,
+        wait_s: float = 0.0,
+    ) -> tuple[dict[int, can.Message], dict[int, can.Message]]:
         """
-        Receive a response from a motor.
+        The one receive path for every Damiao read and write: drain the rx queue newest-wins,
+        optionally send a request, then wait (bounded) for replies to it.
+
+        1. Non-blocking drain: `recv(timeout=0)` until the queue is empty, keeping the newest frame
+           per expected ID. Older duplicates and unexpected IDs are consumed and dropped, so a backlog
+           can't build up across calls. The drain stops early after `DRAIN_CAP` frames or
+           `DRAIN_MAX_S` of wall time (rate-limited warning); the rest is consumed on later calls.
+        2. If `send` is given it is called once, outside any error handling, so TX errors propagate.
+        3. Wait until `wait_s` has elapsed or every expected ID has a fresh frame, consuming at most
+           `DRAIN_CAP` more frames. A frame is *fresh* if it was dequeued after `send` and its rx
+           timestamp is not older than the send time (minus `FRESH_EPS_S`), so a backlog left over by a
+           capped drain is never mistaken for a reply. Freshness is by ID: a late MIT reply from the
+           same motor that lands after the send counts too (both reply types share the recv ID and
+           carry the same state layout, each with its own honest rx timestamp).
+
+        Every kept frame's `timestamp` is normalized: interfaces without usable rx timestamps (0, or
+        more than `PLAUSIBLE_TS_SKEW_S` away from `time.time()`, e.g. a device-relative clock) get the
+        host receipt time instead, with a one-time warning. slcan stamps frames when they are parsed,
+        so there the age hides time spent queued in the host.
+
+        Not thread-safe: one bus must only be used from one thread at a time.
 
         Args:
-            expected_recv_id: If provided, only return messages from this CAN ID
-            timeout: Timeout in seconds (default: 1ms for high-speed operation)
-        Returns:
-            CAN message if received, None otherwise
-        """
-
-        if self.canbus is None:
-            raise RuntimeError("CAN bus is not initialized.")
-
-        try:
-            start_time = time.time()
-            messages_seen = []
-            while time.time() - start_time < timeout:
-                msg = self.canbus.recv(timeout=PRECISE_TIMEOUT_SEC)
-                if msg:
-                    messages_seen.append(f"0x{msg.arbitration_id:02X}")
-                    if expected_recv_id is None or msg.arbitration_id == expected_recv_id:
-                        return msg
-                    logger.debug(
-                        f"Ignoring message from 0x{msg.arbitration_id:02X}, expected 0x{expected_recv_id:02X}"
-                    )
-
-            if logger.isEnabledFor(logging.DEBUG):
-                if messages_seen:
-                    logger.debug(
-                        f"Received {len(messages_seen)} msgs from {set(messages_seen)}, expected 0x{expected_recv_id:02X}"
-                    )
-                else:
-                    logger.debug(f"No CAN messages received (expected 0x{expected_recv_id:02X})")
-        except Exception as e:
-            logger.debug(f"Failed to receive CAN message: {e}")
-        return None
-
-    def _recv_all_responses(
-        self, expected_recv_ids: list[int], timeout: float = 0.002
-    ) -> dict[int, can.Message]:
-        """
-        Efficiently receive responses from multiple motors at once.
-        Uses the OpenArms pattern: collect all available messages within timeout.
-
-        Args:
-            expected_recv_ids: List of CAN IDs we expect responses from
-            timeout: Total timeout in seconds (default: 2ms)
+            expected_ids: CAN recv IDs whose frames to keep.
+            send: Optional callable that transmits the request(s).
+            wait_s: Maximum time to wait for fresh frames. 0 means drain only.
 
         Returns:
-            Dictionary mapping recv_id to CAN message
+            `(newest, fresh)`: the newest frame per expected ID seen in any phase, and the subset of
+            those that are fresh (empty if `send` is None).
         """
-        responses: dict[int, can.Message] = {}
-        expected_set = set(expected_recv_ids)
-        start_time = time.time()
-
-        if self.canbus is None:
+        bus = self.canbus
+        if bus is None:
             raise RuntimeError("CAN bus is not initialized.")
 
-        try:
-            while len(responses) < len(expected_recv_ids) and (time.time() - start_time) < timeout:
-                # 100us poll timeout
-                msg = self.canbus.recv(timeout=PRECISE_TIMEOUT_SEC)
-                if msg and msg.arbitration_id in expected_set:
-                    responses[msg.arbitration_id] = msg
-                    if len(responses) == len(expected_recv_ids):
-                        break
-        except Exception as e:
-            logger.debug(f"Error receiving responses: {e}")
+        expected = set(expected_ids)
+        newest: dict[int, can.Message] = {}
+        fresh: dict[int, can.Message] = {}
 
-        return responses
+        def keep(msg: can.Message) -> None:
+            self._normalize_timestamp(msg)
+            newest[msg.arbitration_id] = msg
+
+        drain_deadline = time.perf_counter() + DRAIN_MAX_S
+        consumed = 0
+        while True:
+            msg = self._recv(bus, 0)
+            if msg is None:
+                break
+            consumed += 1
+            if msg.arbitration_id in expected:
+                keep(msg)
+            if consumed >= DRAIN_CAP or time.perf_counter() >= drain_deadline:
+                self._rate_limited_warning(
+                    "flood",
+                    f"CAN rx flood on {self.port}: drained {consumed} frames in "
+                    f"{DRAIN_MAX_S * 1e3:.0f} ms without emptying the queue.",
+                )
+                break
+
+        if send is None:
+            return newest, fresh
+        send_wall = time.time()
+        send()
+
+        deadline = time.perf_counter() + wait_s
+        consumed = 0
+        while consumed < DRAIN_CAP and not expected.issubset(fresh):
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                break
+            msg = self._recv(bus, remaining)
+            if msg is None:
+                break
+            consumed += 1
+            if msg.arbitration_id in expected:
+                keep(msg)
+                if msg.timestamp >= send_wall - FRESH_EPS_S:
+                    fresh[msg.arbitration_id] = msg
+
+        return newest, fresh
+
+    def _recv(self, bus: "can.BusABC", timeout: float) -> can.Message | None:
+        """`bus.recv`, turning receive errors into a rate-limited warning and `None`."""
+        try:
+            return bus.recv(timeout=timeout)
+        except Exception as e:
+            self._rate_limited_warning("recv", f"CAN receive error on {self.port}: {e}")
+            return None
+
+    def _normalize_timestamp(self, msg: can.Message) -> None:
+        """Replace a missing or implausible rx timestamp with the host receipt time (warns once)."""
+        now = time.time()
+        if msg.timestamp and abs(now - msg.timestamp) <= PLAUSIBLE_TS_SKEW_S:
+            return
+        if not self._warned_host_ts:
+            self._warned_host_ts = True
+            logger.warning(
+                f"CAN interface on {self.port} gives no usable rx timestamps (got {msg.timestamp!r}); "
+                "state ages use host receipt time and hide time spent queued in the driver."
+            )
+        msg.timestamp = now
+
+    def _rate_limited_warning(self, key: str, text: str) -> None:
+        """Log `text` at most once per `STALE_WARN_INTERVAL_S` per `key` on this bus."""
+        now = time.monotonic()
+        if now - self._last_warn.get(key, -math.inf) < STALE_WARN_INTERVAL_S:
+            return
+        self._last_warn[key] = now
+        logger.warning(text)
 
     def _encode_mit_packet(
         self,
@@ -482,11 +556,9 @@ class DamiaoMotorsBus(MotorsBusBase):
         msg = can.Message(arbitration_id=motor_id, data=data, is_extended_id=False, is_fd=self.use_can_fd)
         self.canbus.send(msg)
 
-        recv_id = self._get_motor_recv_id(motor)
-        if msg := self._recv_motor_response(expected_recv_id=recv_id):
-            self._process_response(motor_name, msg)
-        else:
-            logger.debug(f"No response from {motor_name} after MIT control command")
+        # MIT replies are only drained (no wait) so they can't queue up; the cache is updated by
+        # refreshes. A late MIT reply can still be picked up by the next refresh (see `_drain_newest`).
+        self._drain_newest(self._recv_id_to_motor)
 
     def _mit_control_batch(
         self,
@@ -494,7 +566,11 @@ class DamiaoMotorsBus(MotorsBusBase):
     ) -> None:
         """
         Send MIT control commands to multiple motors in batch.
-        Sends all commands first, then collects responses.
+        Sends all commands, then drains (without waiting) any queued replies so they can't
+        accumulate. This call never updates the state cache; that comes from refreshes in
+        `sync_read_all_states` / `sync_read`. An MIT reply that lands after this drain shares its
+        recv ID with refresh replies, so the next refresh may use it (as a fresh or fallback frame,
+        with its own true rx timestamp).
 
         Args:
             commands: Dict mapping motor name/ID to (kp, kd, position_deg, velocity_deg/s, torque)
@@ -502,8 +578,6 @@ class DamiaoMotorsBus(MotorsBusBase):
         """
         if not commands:
             return
-
-        recv_id_to_motor: dict[int, str] = {}
 
         if self.canbus is None:
             raise RuntimeError("CAN bus is not initialized.")
@@ -518,13 +592,8 @@ class DamiaoMotorsBus(MotorsBusBase):
             msg = can.Message(arbitration_id=motor_id, data=data, is_extended_id=False, is_fd=self.use_can_fd)
             self.canbus.send(msg)
 
-            recv_id_to_motor[self._get_motor_recv_id(motor)] = motor_name
-
-        # Step 2: Collect responses and update state cache
-        responses = self._recv_all_responses(list(recv_id_to_motor.keys()), timeout=SHORT_TIMEOUT_SEC)
-        for recv_id, motor_name in recv_id_to_motor.items():
-            if msg := responses.get(recv_id):
-                self._process_response(motor_name, msg)
+        # Step 2: Drain queued replies (newest-wins, no wait); they are not the observation source
+        self._drain_newest(self._recv_id_to_motor)
 
     def _float_to_uint(self, x: float, x_min: float, x_max: float, bits: int) -> int:
         """Convert float to unsigned integer for CAN transmission."""
@@ -567,7 +636,7 @@ class DamiaoMotorsBus(MotorsBusBase):
         return np.degrees(position_rad), np.degrees(velocity_rad_per_sec), torque, t_mos, t_rotor
 
     def _process_response(self, motor: str, msg: can.Message) -> None:
-        """Decode a message and update the motor state cache."""
+        """Decode a message and update the motor state cache, keeping the frame's rx timestamp."""
         try:
             motor_type = self._motor_types[motor]
             pos, vel, torque, t_mos, t_rotor = self._decode_motor_state(msg.data, motor_type)
@@ -578,6 +647,8 @@ class DamiaoMotorsBus(MotorsBusBase):
                 "torque": torque,
                 "temp_mos": float(t_mos),
                 "temp_rotor": float(t_rotor),
+                # Normalized to epoch seconds by `_drain_newest` (host receipt time if unusable).
+                "timestamp": float(msg.timestamp),
             }
         except Exception as e:
             logger.warning(f"Failed to decode response from {motor}: {e}")
@@ -660,9 +731,13 @@ class DamiaoMotorsBus(MotorsBusBase):
         """
         Read ALL motor states (position, velocity, torque) from multiple motors in ONE refresh cycle.
 
+        A motor whose reply misses the `state_wait_s` window keeps its newest older reading; its
+        `timestamp` (and `state_age_s()`) then reports how old that reading really is.
+
         Returns:
-            Dictionary mapping motor names to state dicts with keys: 'position', 'velocity', 'torque'
-            Example: {'joint_1': {'position': 45.2, 'velocity': 1.3, 'torque': 0.5}, ...}
+            Dictionary mapping motor names to `MotorState` dicts with keys 'position', 'velocity',
+            'torque', 'temp_mos', 'temp_rotor' and 'timestamp' (kernel rx time, epoch seconds).
+            Example: {'joint_1': {'position': 45.2, 'velocity': 1.3, 'torque': 0.5, ...}, ...}
         """
         target_motors = self._get_motors_list(motors)
         self._batch_refresh(target_motors)
@@ -673,32 +748,86 @@ class DamiaoMotorsBus(MotorsBusBase):
         return result
 
     def _batch_refresh(self, motors: list[str]) -> None:
-        """Internal helper to refresh a list of motors and update cache."""
+        """
+        Refresh a list of motors and update the cache.
 
-        if self.canbus is None:
+        Drains the rx queue (newest-wins), sends one refresh per motor, then waits at most
+        `state_wait_s` for the replies. A motor that misses the window falls back to the newest older
+        frame drained from the queue (which may be a late MIT reply), or else its last-known state,
+        each with its true rx timestamp, and its `refresh_miss_count` is incremented. A motor that has
+        never replied keeps zeros with timestamp 0.0 (age `math.inf`) and gets its own warning.
+        """
+
+        bus = self.canbus
+        if bus is None:
             raise RuntimeError("CAN bus is not initialized.")
 
-        # Send refresh commands
+        refreshes = []
         for motor in motors:
             motor_id = self._get_motor_id(motor)
             data = [motor_id & 0xFF, (motor_id >> 8) & 0xFF, CAN_CMD_REFRESH, 0, 0, 0, 0, 0]
-            msg = can.Message(
-                arbitration_id=CAN_PARAM_ID, data=data, is_extended_id=False, is_fd=self.use_can_fd
+            refreshes.append(
+                can.Message(
+                    arbitration_id=CAN_PARAM_ID, data=data, is_extended_id=False, is_fd=self.use_can_fd
+                )
             )
-            self.canbus.send(msg)
 
-        # Collect responses
+        def send_refreshes() -> None:
+            for msg in refreshes:
+                bus.send(msg)
+
         expected_recv_ids = [self._get_motor_recv_id(m) for m in motors]
-        responses = self._recv_all_responses(expected_recv_ids, timeout=MEDIUM_TIMEOUT_SEC)
+        newest, fresh = self._drain_newest(expected_recv_ids, send=send_refreshes, wait_s=self.state_wait_s)
 
         # Update cache
-        for motor in motors:
-            recv_id = self._get_motor_recv_id(motor)
-            msg = responses.get(recv_id)
-            if msg:
+        missed = []
+        for motor, recv_id in zip(motors, expected_recv_ids, strict=True):
+            if recv_id not in fresh:
+                missed.append(motor)
+                self.refresh_miss_count[motor] += 1
+            # Never step back to a reading older than the cached one.
+            msg = newest.get(recv_id)
+            if msg is not None and msg.timestamp >= self._last_known_states[motor]["timestamp"]:
                 self._process_response(motor, msg)
-            else:
-                logger.warning(f"Packet drop: {motor} (ID: 0x{recv_id:02X}). Using last known state.")
+        if missed:
+            logger.debug(
+                f"No refresh reply within {self.state_wait_s * 1e3:.1f} ms from {missed} on {self.port}."
+            )
+        self._warn_if_stale(motors)
+
+    def state_age_s(self) -> dict[str, float]:
+        """
+        Age in seconds of each motor's last reading: `time.time()` minus the rx timestamp of the frame
+        it was decoded from (kernel rx time on socketcan, host receipt time on interfaces without
+        usable timestamps), clamped to >= 0.
+
+        Returns:
+            `{motor_name: age_s}` for every motor on the bus. A motor that has never replied maps to
+            `math.inf` (its cached values are placeholders, not a reading).
+        """
+        now = time.time()
+        return {
+            motor: max(0.0, now - state["timestamp"]) if state["timestamp"] > 0 else math.inf
+            for motor, state in self._last_known_states.items()
+        }
+
+    def _warn_if_stale(self, motors: list[str]) -> None:
+        """Warn (at most once per `STALE_WARN_INTERVAL_S` per bus and kind) about stale or missing state."""
+        ages = self.state_age_s()
+        never = [m for m in motors if math.isinf(ages[m])]
+        if never:
+            self._rate_limited_warning(
+                "never",
+                f"Damiao motors on {self.port} never replied: {never}. Their state is a placeholder.",
+            )
+        stale = {m: ages[m] for m in motors if self.stale_warn_s < ages[m] < math.inf}
+        if stale:
+            detail = ", ".join(f"{m}={age * 1e3:.0f}ms" for m, age in stale.items())
+            self._rate_limited_warning(
+                "stale",
+                f"Stale Damiao state on {self.port} (> {self.stale_warn_s * 1e3:.0f} ms): {detail}. "
+                "Using the newest older reading.",
+            )
 
     @check_if_not_connected
     def sync_write(self, data_name: str, values: dict[str, Value]) -> None:
@@ -713,7 +842,6 @@ class DamiaoMotorsBus(MotorsBusBase):
 
         elif data_name == "Goal_Position":
             # Step 1: Send all MIT control commands
-            recv_id_to_motor: dict[int, str] = {}
             if self.canbus is None:
                 raise RuntimeError("CAN bus is not initialized.")
             for motor, value_degrees in values.items():
@@ -731,13 +859,8 @@ class DamiaoMotorsBus(MotorsBusBase):
                 self.canbus.send(msg)
                 precise_sleep(PRECISE_TIMEOUT_SEC)
 
-                recv_id_to_motor[self._get_motor_recv_id(motor)] = motor_name
-
-            # Step 2: Collect responses and update state cache
-            responses = self._recv_all_responses(list(recv_id_to_motor.keys()), timeout=MEDIUM_TIMEOUT_SEC)
-            for recv_id, motor_name in recv_id_to_motor.items():
-                if msg := responses.get(recv_id):
-                    self._process_response(motor_name, msg)
+            # Step 2: Drain queued MIT replies (no wait); observed state comes from refreshes
+            self._drain_newest(self._recv_id_to_motor)
         else:
             # Fall back to individual writes
             for motor, value in values.items():
