@@ -506,6 +506,20 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self._require_writer("save_episode")
         self.writer.save_episode(episode_data, parallel_encoding)
 
+    def add_episode(self, data: dict, tasks: list[str], videos: dict) -> None:
+        """Save a whole episode whose videos are already encoded, without decoding them.
+
+        Args:
+            data: Every non-video user feature, each an array with one row per frame.
+            tasks: The task string of every frame.
+            videos: ``{video_key: (mp4_path, stats)}`` for every video feature, one frame per
+                row, encoded with this dataset's encoder settings (e.g. with
+                :class:`~lerobot.datasets.video_utils.VideoFileEncoder`, which also returns the
+                stats). The files are copied into the dataset; the originals are left alone.
+        """
+        self._require_writer("add_episode")
+        self.writer.add_episode(data, tasks, videos)
+
     def clear_episode_buffer(self, delete_images: bool = True) -> None:
         """Discard the current episode buffer without saving.
 
