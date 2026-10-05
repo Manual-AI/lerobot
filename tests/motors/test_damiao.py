@@ -335,6 +335,45 @@ def test_missed_reply_falls_back_to_newest_older_frame(bus, fake, warnings_log):
     assert _queue_empty(bus)
 
 
+def test_reply_queued_in_time_but_read_after_the_wait_is_not_a_miss(bus, fake):
+    """The thread wakes after the wait ran out (GIL contention) while the replies already sit in the
+    kernel queue: the final non-blocking drain still takes them, so nothing counts as a miss."""
+    bus.state_wait_s = 0.0  # the wait is over before the first blocking recv
+    misses_before = dict(bus.refresh_miss_count)
+
+    states = bus.sync_read_all_states()
+
+    assert bus.refresh_miss_count == misses_before
+    for motor in ("m1", "m2"):
+        seq, ts = fake.last_reply(motor)
+        assert states[motor]["position"] == pytest.approx(_position(seq))
+        assert states[motor]["timestamp"] == ts
+        assert math.isfinite(bus.last_refresh_latency_s[motor])
+    assert _queue_empty(bus)
+
+
+def test_refresh_latency_is_the_reply_delay_after_send_and_nan_on_a_miss(bus, fake, monkeypatch):
+    delay = {"m1": 0.0012, "m2": 0.0031}
+    reply = fake.reply
+
+    def delayed_reply(motor: str) -> None:
+        fake.seq += 1
+        ts = time.time() + delay[motor]  # rx stamp as if the reply took `delay` on the wire
+        fake.replies.append((motor, fake.seq, ts))
+        fake.inject(motor, fake.seq, ts)
+
+    monkeypatch.setattr(fake, "reply", delayed_reply)
+    bus.sync_read_all_states()
+    assert bus.last_refresh_latency_s["m1"] == pytest.approx(0.0012, abs=0.001)
+    assert bus.last_refresh_latency_s["m2"] == pytest.approx(0.0031, abs=0.001)
+
+    monkeypatch.setattr(fake, "reply", reply)
+    fake.silent = {"m2"}
+    bus.sync_read_all_states()
+    assert math.isnan(bus.last_refresh_latency_s["m2"])
+    assert math.isfinite(bus.last_refresh_latency_s["m1"])
+
+
 def test_late_reply_is_used_on_the_next_read(bus, fake):
     fake.silent = {"m1"}
     bus.sync_read_all_states()

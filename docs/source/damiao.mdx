@@ -107,6 +107,11 @@ states = bus.sync_read_all_states()
 # Age in seconds of each motor's last reading. A reply that misses the `bus.state_wait_s` window
 # (default 2 ms) keeps an older reading; a motor that never replied reports math.inf.
 ages = bus.state_age_s()  # {'joint_1': 0.0008, ...}
+
+# Per motor: refreshes whose reply had not arrived by the end of the wait, and how long the last
+# refresh's reply took after the send (NaN on a miss). Use them to size `state_wait_s` on your bus.
+bus.refresh_miss_count       # {'joint_1': 0, ...}
+bus.last_refresh_latency_s   # {'joint_1': 0.0011, ...}
 ```
 
 ### Writing Motor Commands

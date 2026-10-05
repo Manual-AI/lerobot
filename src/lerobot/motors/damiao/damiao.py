@@ -173,6 +173,12 @@ class DamiaoMotorsBus(MotorsBusBase):
         self.state_wait_s: float = STATE_WAIT_S
         # Per motor: refreshes whose reply missed the wait window (state fell back to an older reading).
         self.refresh_miss_count: dict[str, int] = dict.fromkeys(self.motors, 0)
+        # Per motor: seconds from sending the last refresh to its reply's rx timestamp (the first
+        # fresh frame), or NaN if that refresh was missed. Measures what `state_wait_s` must cover.
+        self.last_refresh_latency_s: dict[str, float] = dict.fromkeys(self.motors, math.nan)
+        # Rx timestamp of the first fresh frame per recv ID in the last `_drain_newest` with a send.
+        self._first_fresh_ts: dict[int, float] = {}
+        self._last_send_wall = 0.0
         self._last_warn: dict[str, float] = {}
         self._warned_host_ts = False
 
@@ -397,7 +403,9 @@ class DamiaoMotorsBus(MotorsBusBase):
            `DRAIN_MAX_S` of wall time (rate-limited warning); the rest is consumed on later calls.
         2. If `send` is given it is called once, outside any error handling, so TX errors propagate.
         3. Wait until `wait_s` has elapsed or every expected ID has a fresh frame, consuming at most
-           `DRAIN_CAP` more frames. A frame is *fresh* if it was dequeued after `send` and its rx
+           `DRAIN_CAP` more frames. If the wait ran out first, drain once more without blocking:
+           a reply that reached the kernel in time but was not read because this thread woke late
+           (GIL contention under load) is still taken, so a miss means no reply had arrived. A frame is *fresh* if it was dequeued after `send` and its rx
            timestamp is not older than the send time (minus `FRESH_EPS_S`), so a backlog left over by a
            capped drain is never mistaken for a reply. Freshness is by ID: a late MIT reply from the
            same motor that lands after the send counts too (both reply types share the recv ID and
@@ -451,7 +459,17 @@ class DamiaoMotorsBus(MotorsBusBase):
         if send is None:
             return newest, fresh
         send_wall = time.time()
+        self._last_send_wall = send_wall
+        self._first_fresh_ts = {}
         send()
+
+        def take(msg: can.Message) -> None:
+            if msg.arbitration_id not in expected:
+                return
+            keep(msg)
+            if msg.timestamp >= send_wall - FRESH_EPS_S:
+                fresh[msg.arbitration_id] = msg
+                self._first_fresh_ts.setdefault(msg.arbitration_id, msg.timestamp)
 
         deadline = time.perf_counter() + wait_s
         consumed = 0
@@ -463,10 +481,15 @@ class DamiaoMotorsBus(MotorsBusBase):
             if msg is None:
                 break
             consumed += 1
-            if msg.arbitration_id in expected:
-                keep(msg)
-                if msg.timestamp >= send_wall - FRESH_EPS_S:
-                    fresh[msg.arbitration_id] = msg
+            take(msg)
+
+        # The wait ran out: take whatever is already queued, without blocking.
+        while consumed < DRAIN_CAP and not expected.issubset(fresh):
+            msg = self._recv(bus, 0)
+            if msg is None:
+                break
+            consumed += 1
+            take(msg)
 
         return newest, fresh
 
@@ -754,7 +777,8 @@ class DamiaoMotorsBus(MotorsBusBase):
         Drains the rx queue (newest-wins), sends one refresh per motor, then waits at most
         `state_wait_s` for the replies. A motor that misses the window falls back to the newest older
         frame drained from the queue (which may be a late MIT reply), or else its last-known state,
-        each with its true rx timestamp, and its `refresh_miss_count` is incremented. A motor that has
+        each with its true rx timestamp, and its `refresh_miss_count` is incremented. Each motor's
+        `last_refresh_latency_s` is set to its reply's delay after the send (NaN on a miss). A motor that has
         never replied keeps zeros with timestamp 0.0 (age `math.inf`) and gets its own warning.
         """
 
@@ -785,6 +809,11 @@ class DamiaoMotorsBus(MotorsBusBase):
             if recv_id not in fresh:
                 missed.append(motor)
                 self.refresh_miss_count[motor] += 1
+                self.last_refresh_latency_s[motor] = math.nan
+            else:
+                self.last_refresh_latency_s[motor] = max(
+                    0.0, self._first_fresh_ts[recv_id] - self._last_send_wall
+                )
             # Never step back to a reading older than the cached one.
             msg = newest.get(recv_id)
             if msg is not None and msg.timestamp >= self._last_known_states[motor]["timestamp"]:
