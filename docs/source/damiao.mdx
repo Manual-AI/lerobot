@@ -100,9 +100,18 @@ position = bus.read("Present_Position", "joint_1")
 positions = bus.sync_read("Present_Position")  # All motors
 positions = bus.sync_read("Present_Position", ["joint_1", "joint_2"])
 
-# Read all states at once (position, velocity, torque)
+# Read all states at once (position, velocity, torque, temperatures, rx timestamp)
 states = bus.sync_read_all_states()
-# Returns: {'joint_1': {'position': 45.2, 'velocity': 1.3, 'torque': 0.5}, ...}
+# Returns: {'joint_1': {'position': 45.2, 'velocity': 1.3, 'torque': 0.5, ..., 'timestamp': 1.7e9}, ...}
+
+# Age in seconds of each motor's last reading. A reply that misses the `bus.state_wait_s` window
+# (default 5 ms, ended early once every reply is in) keeps an older reading; a motor that never replied reports math.inf.
+ages = bus.state_age_s()  # {'joint_1': 0.0008, ...}
+
+# Per motor: refreshes whose reply had not arrived by the end of the wait, and how long the last
+# refresh's reply took after the send (NaN on a miss). Use them to size `state_wait_s` on your bus.
+bus.refresh_miss_count       # {'joint_1': 0, ...}
+bus.last_refresh_latency_s   # {'joint_1': 0.0011, ...}
 ```
 
 ### Writing Motor Commands
