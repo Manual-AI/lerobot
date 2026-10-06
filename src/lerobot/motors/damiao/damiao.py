@@ -65,10 +65,12 @@ MEDIUM_TIMEOUT_SEC = 0.01
 SHORT_TIMEOUT_SEC = 0.001
 PRECISE_TIMEOUT_SEC = 0.0001
 
-# Default bounded wait for this tick's refresh replies, after the queue has been drained (settable
-# per bus as `state_wait_s`). The replies to N refreshes need about 2 * N * 130 us on classic 1 Mbps
-# CAN, so 2 ms is tight for 7-8 motors there; a reply that misses it is reported with its true age.
-STATE_WAIT_S = 0.002
+# Default cap on the wait for this tick's refresh replies, after the queue has been drained
+# (settable per bus as `state_wait_s`). The wait ends as soon as every reply is in, so the cap only
+# costs time on a miss. The replies to N refreshes need about 2 * N * 130 us of classic 1 Mbps CAN
+# plus the motors' turnaround: on a 7-motor arm under load the slowest reply measured p50 2.6 ms,
+# p99 3.6 ms (2 ms missed the last joints on most reads), so 5 ms leaves room for 8 motors.
+STATE_WAIT_S = 0.005
 # Max frames consumed by one drain phase, so a flooded bus can't stall a tick.
 DRAIN_CAP = 4096
 # Max wall time of the non-blocking pre-send drain (GIL contention can make each recv slow).
@@ -448,11 +450,19 @@ class DamiaoMotorsBus(MotorsBusBase):
             consumed += 1
             if msg.arbitration_id in expected:
                 keep(msg)
-            if consumed >= DRAIN_CAP or time.perf_counter() >= drain_deadline:
+            if consumed >= DRAIN_CAP:
                 self._rate_limited_warning(
                     "flood",
-                    f"CAN rx flood on {self.port}: drained {consumed} frames in "
-                    f"{DRAIN_MAX_S * 1e3:.0f} ms without emptying the queue.",
+                    f"CAN rx flood on {self.port}: drained {consumed} frames without emptying the "
+                    "queue; the rest is read on later calls.",
+                )
+                break
+            if time.perf_counter() >= drain_deadline:
+                # Few frames but no time: each recv waited to reacquire the GIL (CPU contention).
+                self._rate_limited_warning(
+                    "drain_slow",
+                    f"CAN rx drain on {self.port} hit its {DRAIN_MAX_S * 1e3:.0f} ms limit after "
+                    f"{consumed} frames (CPU/GIL contention); the rest is read on later calls.",
                 )
                 break
 

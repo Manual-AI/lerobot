@@ -380,7 +380,7 @@ def test_late_reply_is_used_on_the_next_read(bus, fake):
     assert bus._last_known_states["m1"]["timestamp"] == 0.0
 
     t_late = time.time()
-    fake.inject("m1", 42, t_late)  # the reply that missed the 2 ms window
+    fake.inject("m1", 42, t_late)  # the reply that missed the wait window
     states = bus.sync_read_all_states()
 
     assert states["m1"]["position"] == pytest.approx(_position(42))
@@ -551,6 +551,18 @@ def test_drain_stops_at_cap_and_warns(bus, fake, warnings_log, monkeypatch):
     while bus.canbus.recv(timeout=0) is not None:
         remaining += 1
     assert remaining == 15
+
+
+def test_drain_stopped_by_its_time_limit_is_not_called_a_flood(bus, fake, warnings_log, monkeypatch):
+    monkeypatch.setattr(damiao, "DRAIN_MAX_S", 0.0)  # every recv "took too long"
+    for i in range(3):
+        fake.inject("m1", i, time.time())
+
+    bus._drain_newest(RECV_IDS.values())
+
+    messages = [r.getMessage() for r in warnings_log()]
+    assert not any("CAN rx flood" in m for m in messages)
+    assert sum("hit its 0 ms limit after 1 frames" in m for m in messages) == 1
 
 
 def test_backlog_beyond_cap_is_not_reported_as_fresh(bus, fake, monkeypatch):
