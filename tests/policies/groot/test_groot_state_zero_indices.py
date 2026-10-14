@@ -28,7 +28,7 @@ import pytest
 import torch
 
 from lerobot.lerobot_types import TransitionKey
-from lerobot.policies.groot.processor_groot import GrootN17PackInputsStep
+from lerobot.policies.groot.processor_groot import GrootN17PackInputsStep, _apply_groot_step_overrides
 from lerobot.policies.groot.utils import homogeneous_to_xyz_rot6d
 from lerobot.processor import DataProcessorPipeline
 from lerobot.processor.converters import identity_transition
@@ -219,7 +219,9 @@ def test_invalid_indices_are_refused_at_construction(indices, match):
 
 
 def test_indices_beyond_the_real_state_dim_are_refused_at_call_time():
-    step = _make_step(state_zero_indices=[STATE_DIM])
+    """Stats padded to `max_state_dim` pass construction; the real state dim is known only at call."""
+    padded_stats = {OBS_STATE: {"min": [-2.0] * MAX_DIM, "max": [2.0] * MAX_DIM}}
+    step = _make_step(state_zero_indices=[STATE_DIM], stats=padded_stats)
     with pytest.raises(ValueError, match="out of range for a dimension of size 12"):
         _run(step)
 
@@ -295,3 +297,24 @@ def test_pipeline_saved_without_the_field_loads_unmasked(tmp_path):
         to_output=identity_transition,
     )
     assert loaded.steps[0].state_zero_indices == []
+
+
+def test_mask_refuses_indices_past_the_state_stats():
+    """`_min_max_norm` would pad short stats with a made-up 0..1 range for the missing dims."""
+    short_stats = {OBS_STATE: {"min": [-2.0] * EEF_DIM, "max": [2.0] * EEF_DIM}}
+    with pytest.raises(ValueError, match="min/max stats cover"):
+        _make_step(state_zero_indices=[EEF_DIM], stats=short_stats)
+
+
+def test_mask_set_through_groot_step_overrides():
+    """Raw N1.7 checkpoints receive caller fields through `_apply_groot_step_overrides`."""
+    pipeline = DataProcessorPipeline([_make_step()])
+    _apply_groot_step_overrides(pipeline, {"groot_n1_7_pack_inputs_v1": {"state_zero_indices": EEF_MASK}})
+    assert pipeline.steps[0].state_zero_indices == EEF_MASK
+    out = pipeline.steps[0](_make_transition())
+    assert torch.equal(out[TransitionKey.OBSERVATION]["state"][..., EEF_MASK], torch.zeros(2, 1, EEF_DIM))
+
+    with pytest.raises(ValueError, match="out of range"):
+        _apply_groot_step_overrides(
+            pipeline, {"groot_n1_7_pack_inputs_v1": {"state_zero_indices": [MAX_DIM]}}
+        )

@@ -465,8 +465,10 @@ class NormalizerProcessorStep(_NormalizationMixin, ProcessorStep):
             of place, so tensors that earlier steps cached from the raw observation (e.g. the
             anchor of `RelativeActionsProcessorStep`) stay untouched. Only keys that are
             really normalized are accepted (see `validate_zero_features`), because for any
-            other key the normalizer hands back the raw tensor object itself. Serialized only
-            when non-empty, so unmasked pipelines keep loading on stock lerobot.
+            other key the normalizer hands back the raw tensor object itself. Steps that
+            anchor on the raw observation must run before this one, as the policy factories
+            order them. Serialized only when non-empty, so unmasked pipelines keep loading on
+            stock lerobot.
     """
 
     zero_features: dict[str, list[int]] = field(default_factory=dict)
@@ -490,8 +492,8 @@ class NormalizerProcessorStep(_NormalizationMixin, ProcessorStep):
                 only before stats are loaded.
 
         Raises:
-            ValueError: If a key is not an observation feature of this normalizer, is
-                excluded by `normalize_observation_keys`, uses IDENTITY normalization or has
+            ValueError: If a key is not a non-visual observation feature of this normalizer,
+                is excluded by `normalize_observation_keys`, uses IDENTITY normalization or has
                 no stats, or if its indices are empty, not integers, repeated, negative or
                 not below the feature's last dimension.
         """
@@ -505,6 +507,11 @@ class NormalizerProcessorStep(_NormalizationMixin, ProcessorStep):
             if feature.type == FeatureType.ACTION:
                 raise ValueError(
                     f"zero_features key '{key}' is an action feature; only observations can be zeroed."
+                )
+            if feature.type == FeatureType.VISUAL:
+                raise ValueError(
+                    f"zero_features key '{key}' is a visual feature; its last dimension is image width, "
+                    "not a list of named dims."
                 )
             if self.normalize_observation_keys is not None and key not in self.normalize_observation_keys:
                 raise ValueError(
@@ -530,6 +537,8 @@ class NormalizerProcessorStep(_NormalizationMixin, ProcessorStep):
             if key not in normalized:
                 continue
             value = normalized[key]
+            # Backstop only: `validate_zero_features` already refuses every key that the
+            # normalizer would return unchanged (a non-tensor input is always converted anew).
             if value is raw.get(key):
                 raise RuntimeError(
                     f"zero_features key '{key}' was not normalized (the normalizer returned the raw "

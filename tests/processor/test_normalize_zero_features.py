@@ -33,6 +33,7 @@ from lerobot.processor import (
     NormalizerProcessorStep,
     RelativeActionsProcessorStep,
     TransitionKey,
+    hotswap_stats,
 )
 from lerobot.processor.converters import create_transition, identity_transition
 from lerobot.utils.constants import ACTION, OBS_STATE
@@ -326,3 +327,38 @@ def test_pi05_prompt_state_bins_come_from_the_masked_state():
         assert [bins[i] for i in MASK] == [zero_bin] * len(MASK)
         expected_kept = np.digitize(masked_state[row, KEPT], bins=bin_edges) - 1
         assert [bins[i] for i in KEPT] == expected_kept.tolist()
+
+
+def test_zero_features_refuses_a_visual_key():
+    with pytest.raises(ValueError, match="visual feature"):
+        NormalizerProcessorStep(
+            features={**FEATURES, "observation.images.cam": PolicyFeature(FeatureType.VISUAL, (3, 4, 4))},
+            norm_map={
+                **_norm_map(NormalizationMode.MEAN_STD),
+                FeatureType.VISUAL: NormalizationMode.MEAN_STD,
+            },
+            stats={**STATS, "observation.images.cam": {"mean": torch.zeros(3), "std": torch.ones(3)}},
+            zero_features={"observation.images.cam": [0]},
+        )
+
+
+def test_hotswap_stats_without_the_masked_key_refuses_on_call():
+    pipeline = DataProcessorPipeline(
+        [_normalizer()], to_transition=identity_transition, to_output=identity_transition
+    )
+    swapped = hotswap_stats(pipeline, {ACTION: STATS[ACTION]})
+    with pytest.raises(ValueError, match="no normalization stats"):
+        swapped(create_transition(observation={OBS_STATE: _state()}))
+
+
+def test_zero_features_set_through_from_pretrained_overrides(tmp_path):
+    DataProcessorPipeline([_normalizer(zero_features={})], name="plain").save_pretrained(tmp_path)
+    loaded = DataProcessorPipeline.from_pretrained(
+        tmp_path,
+        config_filename="plain.json",
+        overrides={"normalizer_processor": {"zero_features": {OBS_STATE: MASK}}},
+        to_transition=identity_transition,
+        to_output=identity_transition,
+    )
+    out = loaded(create_transition(observation={OBS_STATE: _state()}))
+    assert torch.equal(out[TransitionKey.OBSERVATION][OBS_STATE][:, MASK], torch.zeros(2, len(MASK)))

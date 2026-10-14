@@ -1730,8 +1730,9 @@ class GrootN17PackInputsStep(ProcessorStep):
         Raises:
             ValueError: If the indices are not unique non-negative integers below the state
                 dimension (or `max_state_dim`), if `normalize_min_max` is off, or if the
-                state has no min/max stats; in the last two cases the state reaching the
-                mask is raw, so zero would not be the range midpoint.
+                state has no min/max stats covering every masked dim; in the last cases the
+                state reaching the mask is not normalized with the dataset's range, so zero
+                would not be its midpoint.
         """
         if not self.state_zero_indices:
             return
@@ -1751,6 +1752,17 @@ class GrootN17PackInputsStep(ProcessorStep):
                 raise ValueError(
                     f"state_zero_indices requires min/max stats for '{OBS_STATE}': without them the state "
                     "is not normalized and cannot be zeroed in normalized space."
+                )
+            # `_min_max_norm` pads stats shorter than the state with min=0 / max=1, which is not
+            # the dataset's range, so every masked dim must have real stats.
+            stats_dim = min(
+                torch.as_tensor(state_stats["min"]).reshape(-1).shape[0],
+                torch.as_tensor(state_stats["max"]).reshape(-1).shape[0],
+            )
+            if max(self.state_zero_indices) >= stats_dim:
+                raise ValueError(
+                    f"state_zero_indices {self.state_zero_indices} reach past the {stats_dim} dims that "
+                    f"'{OBS_STATE}' min/max stats cover."
                 )
 
     def _ordered_image_keys(self, obs: dict[str, Any]) -> list[str]:
