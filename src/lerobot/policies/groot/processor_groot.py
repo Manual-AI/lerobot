@@ -67,6 +67,7 @@ from lerobot.processor import (
     transition_to_batch,
     transition_to_policy_action,
 )
+from lerobot.processor.normalize_processor import validate_zero_indices
 from lerobot.utils.constants import (
     ACTION,
     OBS_IMAGE,
@@ -1684,6 +1685,11 @@ class GrootN17PackInputsStep(ProcessorStep):
     normalize_min_max: bool = True
     training: bool = False
     state_dropout_prob: float = 0.0
+    # State dims hidden from the model: zeroed after min-max normalization and padding (0 is the
+    # midpoint of the range), on every call whatever `training` or grad mode says, and out of
+    # place, so the raw-state cache that relative-action encoding and decoding anchor on keeps the
+    # real values. Serialized only when non-empty. See `validate_state_zero_indices`.
+    state_zero_indices: list[int] = field(default_factory=list)
     stats: dict[str, dict[str, Any]] | None = None
     clip_outliers: bool = True
     use_percentiles: bool = False
@@ -1700,6 +1706,52 @@ class GrootN17PackInputsStep(ProcessorStep):
     _warned_rtc_prefix_decode_transform: bool = field(default=False, init=False, repr=False)
     _warned_rtc_prefix_horizon: bool = field(default=False, init=False, repr=False)
     _warned_rtc_prefix_layout: bool = field(default=False, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.state_zero_indices = list(self.state_zero_indices or [])
+        # Pipelines loaded with `from_pretrained` get their stats from `load_state_dict` after
+        # construction, so the stats check waits for the first call in that case.
+        self.validate_state_zero_indices(require_stats=self.stats is not None)
+
+    def validate_state_zero_indices(
+        self, *, state_dim: int | None = None, require_stats: bool = True
+    ) -> None:
+        """Check that `state_zero_indices` can be applied as a normalized-space mask.
+
+        Runs at construction and on every call, since assigning the attribute after
+        construction skips `__post_init__`. Callers that set `state_zero_indices` on an
+        existing step can call it directly to fail early.
+
+        Args:
+            state_dim: The real (unpadded) state dimension, when known.
+            require_stats: Also require min/max stats for `observation.state`. Disable only
+                before stats are loaded.
+
+        Raises:
+            ValueError: If the indices are not unique non-negative integers below the state
+                dimension (or `max_state_dim`), if `normalize_min_max` is off, or if the
+                state has no min/max stats; in the last two cases the state reaching the
+                mask is raw, so zero would not be the range midpoint.
+        """
+        if not self.state_zero_indices:
+            return
+        validate_zero_indices(
+            "state_zero_indices",
+            self.state_zero_indices,
+            state_dim if state_dim is not None else self.max_state_dim,
+        )
+        if not self.normalize_min_max:
+            raise ValueError(
+                "state_zero_indices requires normalize_min_max=True: the mask zeroes state dims in "
+                "min-max normalized space."
+            )
+        if require_stats:
+            state_stats = (self.stats or {}).get(OBS_STATE)
+            if not isinstance(state_stats, dict) or "min" not in state_stats or "max" not in state_stats:
+                raise ValueError(
+                    f"state_zero_indices requires min/max stats for '{OBS_STATE}': without them the state "
+                    "is not normalized and cannot be zeroed in normalized space."
+                )
 
     def _ordered_image_keys(self, obs: dict[str, Any]) -> list[str]:
         available = {key for key in obs if key.startswith(OBS_IMAGES)}
@@ -2167,6 +2219,7 @@ class GrootN17PackInputsStep(ProcessorStep):
             bsz, dim = state.shape
             if dim > self.max_state_dim:
                 raise ValueError(f"State dimension {dim} exceeds max_state_dim {self.max_state_dim}.")
+            self.validate_state_zero_indices(state_dim=dim)
             _cache_raw_state(state)
             raw_state_for_action = state
             if self.normalize_min_max:
@@ -2175,6 +2228,11 @@ class GrootN17PackInputsStep(ProcessorStep):
             if dim < self.max_state_dim:
                 pad = torch.zeros(bsz, 1, self.max_state_dim - dim, dtype=state.dtype, device=state.device)
                 state = torch.cat([state, pad], dim=2)
+            if self.state_zero_indices:
+                # Out of place: without padding `state` can still be a view of the raw tensor
+                # that `raw_state_for_action` and the raw-state cache hold.
+                zero_index = torch.as_tensor(self.state_zero_indices, dtype=torch.long, device=state.device)
+                state = state.index_fill(-1, zero_index, 0)
             if self.training and torch.is_grad_enabled() and self.state_dropout_prob > 0:
                 drop_state = torch.tensor(
                     [random.random() < self.state_dropout_prob for _ in range(bsz)],
@@ -2281,7 +2339,7 @@ class GrootN17PackInputsStep(ProcessorStep):
         return features
 
     def get_config(self) -> dict[str, Any]:
-        return {
+        config = {
             "state_horizon": self.state_horizon,
             "action_horizon": self.action_horizon,
             "valid_action_horizon": self.valid_action_horizon,
@@ -2300,6 +2358,9 @@ class GrootN17PackInputsStep(ProcessorStep):
             "raw_stats": self.raw_stats,
             "modality_config": self.modality_config,
         }
+        if self.state_zero_indices:
+            config["state_zero_indices"] = list(self.state_zero_indices)
+        return config
 
     def get_cached_raw_state(self) -> dict[str, np.ndarray] | None:
         """Return the latest unnormalized state split by checkpoint modality key."""
