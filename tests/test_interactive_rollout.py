@@ -1305,6 +1305,16 @@ def _make_rtc_engine(rtc_queue_threshold: int = 30, chunk_len: int = 10):
 _RTC_OBS = {"j1.pos": 0.0, "j2.pos": 0.0}
 
 
+def _control_tick(engine):
+    """One control-loop tick: publish an observation, then dispatch the next action.
+
+    The engine plans the next chunk only from an observation published after the last merge,
+    as a real control loop provides every tick.
+    """
+    engine.notify_observation(dict(_RTC_OBS))
+    return engine.get_action(None)
+
+
 @contextlib.contextmanager
 def _running_rtc_engine(rtc_queue_threshold: int = 30, chunk_len: int = 10):
     engine, policy = _make_rtc_engine(rtc_queue_threshold=rtc_queue_threshold, chunk_len=chunk_len)
@@ -1324,7 +1334,7 @@ def test_rtc_engine_dispatched_task_tracks_chunk_provenance_across_set_task():
     with _running_rtc_engine() as (engine, policy):
         policy.allow_one_inference()  # first chunk, conditioned on "task A"
         assert _wait_for(lambda: len(policy.predicted_tasks) == 1)
-        assert _wait_for(lambda: engine.get_action(None) is not None)
+        assert _wait_for(lambda: _control_tick(engine) is not None)
         assert engine.dispatched_task == "task A"
 
         # The loop is parked inside the next predict, with that chunk's task (still A)
@@ -1333,16 +1343,21 @@ def test_rtc_engine_dispatched_task_tracks_chunk_provenance_across_set_task():
         assert engine.set_task("task B") is True
 
         # Leftovers still serve under the old label.
-        assert engine.get_action(None) is not None
+        assert _control_tick(engine) is not None
         assert engine.dispatched_task == "task A"
 
         policy.allow_one_inference()  # the in-flight chunk (still task A) lands
         policy.allow_one_inference()  # the next chunk is conditioned on task B
-        assert _wait_for(lambda: len(policy.predicted_tasks) == 3)
+
+        def _predicted_three():
+            _control_tick(engine)  # keeps the loop supplied with post-merge observations
+            return len(policy.predicted_tasks) == 3
+
+        assert _wait_for(_predicted_three)
         assert policy.predicted_tasks == ["task A", "task A", "task B"]
 
         def _dispatched_b():
-            return engine.get_action(None) is not None and engine.dispatched_task == "task B"
+            return _control_tick(engine) is not None and engine.dispatched_task == "task B"
 
         assert _wait_for(_dispatched_b)
 
