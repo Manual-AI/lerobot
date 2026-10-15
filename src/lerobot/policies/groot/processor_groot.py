@@ -1502,9 +1502,14 @@ def _align_video_horizon(video: np.ndarray, horizon: int | None) -> np.ndarray:
 
 def _build_n1_7_processor(model_name: str = GROOT_N1_7_BACKBONE_MODEL) -> ProcessorMixin:
     require_package("transformers", extra="groot")
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    image_processor = Qwen2VLImageProcessor.from_pretrained(model_name, trust_remote_code=True)
-    video_processor = Qwen3VLVideoProcessor.from_pretrained(model_name, trust_remote_code=True)
+    try:
+        # Each online load re-checks the Hub even when cached (about 2 s for the three, and a
+        # 401 without a token, since the backbone repo is gated), so try the cache first.
+        tokenizer, image_processor, video_processor = _load_n1_7_processor_parts(
+            model_name, local_files_only=True
+        )
+    except (OSError, ValueError):
+        tokenizer, image_processor, video_processor = _load_n1_7_processor_parts(model_name)
     proc = Qwen3VLProcessor(
         image_processor=image_processor,
         tokenizer=tokenizer,
@@ -1513,6 +1518,14 @@ def _build_n1_7_processor(model_name: str = GROOT_N1_7_BACKBONE_MODEL) -> Proces
     )
     proc.tokenizer.padding_side = "left"
     return proc
+
+
+def _load_n1_7_processor_parts(model_name: str, **kwargs: Any) -> tuple[Any, Any, Any]:
+    """Load the backbone's tokenizer, image processor and video processor."""
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, **kwargs)
+    image_processor = Qwen2VLImageProcessor.from_pretrained(model_name, trust_remote_code=True, **kwargs)
+    video_processor = Qwen3VLVideoProcessor.from_pretrained(model_name, trust_remote_code=True, **kwargs)
+    return tokenizer, image_processor, video_processor
 
 
 def _transform_n1_7_image_for_vlm_albumentations(

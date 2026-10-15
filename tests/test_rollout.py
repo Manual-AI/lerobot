@@ -20,6 +20,7 @@ import dataclasses
 import logging
 import sys
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
@@ -108,30 +109,12 @@ def test_inference_config_types():
     assert rtc.rtc is not None
 
 
-def test_trained_rtc_retries_chunk_when_measured_delay_exceeds_conditioning():
-    from lerobot.rollout.inference.rtc import _trained_rtc_chunk_can_merge
-
-    assert not _trained_rtc_chunk_can_merge(
-        conditioned_delay=2,
-        measured_delay=3,
-        training_max_delay=4,
-        has_previous_actions=True,
-    )
-    assert _trained_rtc_chunk_can_merge(
-        conditioned_delay=2,
-        measured_delay=5,
-        training_max_delay=4,
-        has_previous_actions=False,
-    )
-
-
 def test_trained_rtc_bootstraps_first_overlap_with_checkpoint_capacity():
     from lerobot.rollout.inference.rtc import _estimate_rtc_delay
 
     assert (
         _estimate_rtc_delay(
-            latency=0,
-            time_per_step=1 / 30,
+            recent_delays=[],
             mode="trained",
             training_max_delay=10,
             has_previous_actions=False,
@@ -140,8 +123,7 @@ def test_trained_rtc_bootstraps_first_overlap_with_checkpoint_capacity():
     )
     assert (
         _estimate_rtc_delay(
-            latency=0,
-            time_per_step=1 / 30,
+            recent_delays=[],
             mode="trained",
             training_max_delay=10,
             has_previous_actions=True,
@@ -150,16 +132,38 @@ def test_trained_rtc_bootstraps_first_overlap_with_checkpoint_capacity():
     )
 
 
-def test_trained_rtc_discards_chunk_measured_above_checkpoint_support():
-    """A latency spike past the trained delay discards the chunk; it must not kill the rollout."""
-    from lerobot.rollout.inference.rtc import _trained_rtc_chunk_can_merge
+def test_rtc_delay_estimate_recovers_from_one_slow_inference():
+    """A cold 2.7 s first inference (82 steps at 30 fps) must not size every later prefix.
 
-    assert not _trained_rtc_chunk_can_merge(
-        conditioned_delay=3,
-        measured_delay=5,
-        training_max_delay=4,
-        has_previous_actions=True,
-    )
+    Steady 0.33 s inferences execute 10 actions each; once they fill the window, the estimate
+    is 10, leaving the rest of the overlap to blend.
+    """
+    from collections import deque
+
+    from lerobot.rollout.inference.rtc import _RTC_DELAY_HISTORY_LEN, _estimate_rtc_delay
+
+    history = deque([82], maxlen=_RTC_DELAY_HISTORY_LEN)
+    estimates = []
+    for _ in range(_RTC_DELAY_HISTORY_LEN):
+        history.append(10)
+        estimates.append(
+            _estimate_rtc_delay(
+                recent_delays=history, mode="guided", training_max_delay=0, has_previous_actions=True
+            )
+        )
+
+    # Conservative until the slow sample ages out, then exactly the steady delay.
+    assert estimates[:-1] == [82] * (_RTC_DELAY_HISTORY_LEN - 1)
+    assert estimates[-1] == 10
+
+
+def test_trained_rtc_delay_estimate_keeps_a_step_of_margin():
+    """An under-estimate discards a trained chunk, so trained RTC conditions one step longer."""
+    from lerobot.rollout.inference.rtc import _estimate_rtc_delay
+
+    kwargs = {"recent_delays": [5, 6, 4], "training_max_delay": 10, "has_previous_actions": True}
+    assert _estimate_rtc_delay(mode="guided", **kwargs) == 6
+    assert _estimate_rtc_delay(mode="trained", **kwargs) == 7
 
 
 def test_trained_rtc_clamps_prefix_to_checkpoint_and_queue():
@@ -619,6 +623,54 @@ def test_setup_defaults_to_starting_the_engine():
     assert strategy._engine is engine
     assert strategy._interpolator.multiplier == 2
     engine.start.assert_called_once()
+    engine.warmup.assert_called_once()
+
+
+def _warmup_ctx(engine, robot):
+    return SimpleNamespace(
+        runtime=SimpleNamespace(cfg=SimpleNamespace(interpolation_multiplier=1)),
+        policy=SimpleNamespace(inference=engine),
+        hardware=SimpleNamespace(robot_wrapper=robot),
+        processors=SimpleNamespace(robot_observation_processor=lambda obs: {**obs, "processed": True}),
+    )
+
+
+def _minimal_strategy():
+    from lerobot.rollout import BaseStrategyConfig, RolloutStrategy
+
+    class MinimalStrategy(RolloutStrategy):
+        def run(self, ctx):
+            pass
+
+        def teardown(self, ctx):
+            pass
+
+    return MinimalStrategy(BaseStrategyConfig())
+
+
+def test_setup_warms_the_engine_up_on_a_processed_live_observation():
+    engine = MagicMock()
+    observed = []
+    engine.warmup.side_effect = lambda observe: observed.append(observe())
+    robot = MagicMock()
+    robot.get_observation.return_value = {"m.pos": 1.0}
+
+    _minimal_strategy().setup(_warmup_ctx(engine, robot))
+
+    assert observed == [{"m.pos": 1.0, "processed": True}]
+    robot.send_action.assert_not_called()
+
+
+def test_setup_continues_when_the_warmup_fails(caplog):
+    engine = MagicMock()
+    engine.warmup.side_effect = RuntimeError("no GPU")
+
+    with caplog.at_level(logging.WARNING):
+        strategy = _minimal_strategy()
+        strategy.setup(_warmup_ctx(engine, MagicMock()))
+
+    assert strategy._engine is engine
+    assert "warm-up failed" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -781,6 +833,197 @@ def test_rtc_observation_packet_keeps_the_pre_dispatch_queue_snapshot():
     torch.testing.assert_close(snapshot.original_left_over, original)
     torch.testing.assert_close(snapshot.processed_left_over, processed)
     assert queue.get_action_index() == 1
+
+
+# ---------------------------------------------------------------------------
+# RTC engine thread: warm-up and the counted delay
+# ---------------------------------------------------------------------------
+
+_CHUNK = 30
+
+
+class _IdentityProcessor:
+    steps: ClassVar[list] = []
+
+    def __init__(self):
+        self.resets = 0
+
+    def __call__(self, value):
+        return value
+
+    def reset(self):
+        self.resets += 1
+
+
+class _ScriptedRTCPolicy:
+    """An RTC policy whose inferences overlap a scripted number of executed actions.
+
+    Each ``predict_action_chunk`` plays ``executed[i]`` control ticks (dispatch an action, then
+    publish an observation) while it runs, and records the ``inference_delay`` it was
+    conditioned on. Ticking from inside the inference keeps the counts deterministic.
+    """
+
+    def __init__(self, executed, *, training_max_delay=0, warm_calls=0):
+        self.config = SimpleNamespace(rtc_training_max_delay=training_max_delay)
+        self.engine = None
+        self.executed = list(executed)
+        self.warm_calls = warm_calls  # calls that pop nothing: the warm-up's
+        self.calls: list[tuple[int, bool]] = []
+        self.resets = 0
+        self.rtc_processor = MagicMock()
+        self.done = threading.Event()
+
+    def predict_action_chunk(self, batch, *, inference_delay, prev_chunk_left_over, **kwargs):
+        self.calls.append((inference_delay, prev_chunk_left_over is not None))
+        loop_call = len(self.calls) - self.warm_calls
+        if 1 <= loop_call <= len(self.executed):
+            for _ in range(self.executed[loop_call - 1]):
+                assert self.engine.get_action(None) is not None
+                self.engine.notify_observation({"m.pos": 0.0})
+            if loop_call == len(self.executed):
+                self.done.set()
+        start = 1000.0 * len(self.calls)
+        return (start + torch.arange(_CHUNK * 2, dtype=torch.float32)).view(1, _CHUNK, 2)
+
+    def reset(self):
+        self.resets += 1
+
+
+def _make_threaded_rtc_engine(policy, **rtc_kwargs):
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+    from lerobot.rollout.inference.rtc import RTCInferenceEngine
+
+    engine = RTCInferenceEngine(
+        policy=policy,
+        preprocessor=_IdentityProcessor(),
+        postprocessor=_IdentityProcessor(),
+        robot_wrapper=MagicMock(robot_type="mock"),
+        rtc_config=RTCConfig(execution_horizon=8, **rtc_kwargs),
+        hw_features={"observation.state": {"dtype": "float32", "shape": (1,), "names": ["m.pos"]}},
+        task="test",
+        fps=30.0,
+        device="cpu",
+        rtc_queue_threshold=_CHUNK,  # re-plan back to back: the stale-snapshot worst case
+    )
+    policy.engine = engine
+    return engine
+
+
+def _publish_observations_until(engine, done: threading.Event, timeout_s: float = 10.0) -> None:
+    """Play the control thread between inferences: publish observations, dispatch nothing.
+
+    Stops once the last scripted inference runs, so the loop then idles waiting for an
+    observation newer than that inference's merge.
+    """
+    deadline = time.monotonic() + timeout_s
+    while not done.is_set():
+        assert time.monotonic() < deadline, "the RTC loop did not finish its scripted inferences"
+        engine.notify_observation({"m.pos": 0.0})
+        time.sleep(0.001)
+
+
+def _wait_for_delays(engine, count: int, timeout_s: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    while len(engine._delay_history) < count:
+        assert time.monotonic() < deadline, f"expected {count} recorded delays"
+        time.sleep(0.001)
+
+
+def test_rtc_warmup_runs_both_paths_on_the_rtc_thread_then_resets():
+    policy = _ScriptedRTCPolicy(executed=[], warm_calls=2)
+    engine = _make_threaded_rtc_engine(policy)
+    engine.start()
+    try:
+        observed = []
+        engine.warmup(lambda: observed.append(1) or {"m.pos": 0.0})
+    finally:
+        engine.stop()
+
+    assert observed == [1]
+    # Unguided first, then guided on its own head with a nonzero delay.
+    assert policy.calls == [(0, False), (1, True)]
+    assert policy.resets == 1
+    assert engine._preprocessor.resets == 1 and engine._postprocessor.resets == 1
+    policy.rtc_processor.reset_tracker.assert_called_once()
+    # The queue never saw the warm-up chunks; the warm latency seeded the delay, plus the step
+    # the loop may wait for its next observation.
+    assert engine.action_queue.qsize() == 0
+    assert len(engine._delay_history) == 1
+    assert engine._delay_history[0] >= 1
+
+
+def test_rtc_warmup_failure_is_raised_to_the_caller_and_still_resets():
+    policy = _ScriptedRTCPolicy(executed=[])
+    policy.predict_action_chunk = MagicMock(side_effect=RuntimeError("no GPU"))
+    engine = _make_threaded_rtc_engine(policy)
+    engine.start()
+    try:
+        with pytest.raises(RuntimeError, match="no GPU"):
+            engine.warmup(lambda: {"m.pos": 0.0})
+        assert not engine.failed  # the RTC thread is still up
+    finally:
+        engine.stop()
+
+    assert policy.resets == 1
+    assert list(engine._delay_history) == []
+
+
+def test_rtc_loop_conditions_on_the_largest_recently_executed_delay():
+    """Each merge skips, and the history records, exactly the actions executed meanwhile."""
+    # Inference 1 starts from an empty queue (nothing executes); 2-4 overlap 4, 7 and 2 actions.
+    policy = _ScriptedRTCPolicy(executed=[0, 4, 7, 2])
+    engine = _make_threaded_rtc_engine(policy)
+    engine.start()
+    engine.resume()
+    try:
+        _publish_observations_until(engine, policy.done)
+        _wait_for_delays(engine, 3)
+    finally:
+        engine.stop()
+
+    # An empty-queue inference records no delay; the others record what they overlapped.
+    assert list(engine._delay_history) == [4, 7, 2]
+    # Conditioned on max(history so far): nothing, nothing yet, then 4, then max(4, 7).
+    assert policy.calls == [(0, False), (0, True), (4, True), (7, True)]
+    # The queue resumed at row 2 of chunk 4: the action 2 steps after its observation.
+    torch.testing.assert_close(engine.action_queue.get(), torch.tensor([4004.0, 4005.0]))
+
+
+def test_rtc_loop_waits_for_an_observation_newer_than_the_last_merge():
+    """A packet published before a merge indexes the replaced chunk; inferring from it would
+    count the actions executed wrongly and replay up to an inference's worth of motion."""
+    from lerobot.policies.rtc import ActionQueue
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+
+    queue = ActionQueue(RTCConfig(execution_horizon=8))
+    chunk = torch.zeros(_CHUNK, 2)
+    queue.merge(chunk, chunk, real_delay=0)
+    stale = queue.snapshot_for_inference()
+    queue.merge(chunk, chunk, real_delay=0)
+
+    assert stale.generation != queue.get_generation()
+    assert queue.snapshot_for_inference().generation == queue.get_generation()
+
+
+def test_trained_rtc_loop_retries_a_chunk_whose_prefix_was_outrun():
+    """Conditioned on 4+1 steps but 9 executed: the chunk is discarded and the retry conditions
+    on the 9 it overlapped."""
+    policy = _ScriptedRTCPolicy(executed=[0, 4, 9, 3], training_max_delay=10)
+    engine = _make_threaded_rtc_engine(policy, mode="trained")
+    engine.start()
+    engine.resume()
+    try:
+        _publish_observations_until(engine, policy.done)
+        _wait_for_delays(engine, 3)
+    finally:
+        engine.stop()
+
+    # 1: unconditioned first chunk. 2: bootstraps on the checkpoint's capacity (10). 3: the
+    # 4 executed during 2, plus a step of margin, outrun by 9. 4: the retry, 9 + 1.
+    assert [delay for delay, _ in policy.calls] == [0, 10, 5, 10]
+    assert list(engine._delay_history) == [4, 9, 3]
+    # The discarded chunk never reached the robot: the queue holds chunk 4, 3 rows in.
+    torch.testing.assert_close(engine.action_queue.get(), torch.tensor([4006.0, 4007.0]))
 
 
 def test_rtc_config_prefix_guidance_defaults_to_enabled():

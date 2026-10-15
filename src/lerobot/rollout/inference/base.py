@@ -109,7 +109,7 @@ class InferenceEngine(abc.ABC):
 
     Optional hooks
     --------------
-    ``notify_observation`` / ``pause`` / ``resume`` have a no-op default
+    ``notify_observation`` / ``pause`` / ``resume`` / ``warmup`` have a no-op default
     so rollout strategies can invoke them unconditionally.
 
     Subclasses must call ``super().__init__(task=...)``.
@@ -479,6 +479,13 @@ class InferenceEngine(abc.ABC):
 
     def resume(self) -> None:  # noqa: B027
         """Resume background inference.  Default: no-op."""
+
+    def warmup(self, observe: Callable[[], dict]) -> None:  # noqa: B027
+        """Pay the policy's one-off first-inference costs before the control loop starts.
+
+        ``observe`` returns a processed robot observation; a backend that warms up calls it
+        once. Default: no-op, and ``observe`` is never called.
+        """
 
     @property
     def ready(self) -> bool:
