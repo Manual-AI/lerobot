@@ -560,6 +560,58 @@ def test_merge_never_discards_more_than_was_consumed(action_queue_rtc_enabled, s
     assert action_queue_rtc_enabled.qsize() == len(sample_actions["processed"])
 
 
+def test_merge_resumes_at_the_actions_executed_not_the_latency_estimate(
+    action_queue_rtc_enabled, sample_actions
+):
+    """6 actions ran during inference but latency estimated 5: the queue must resume at row 6.
+
+    Resuming at row 5 would re-send the action the robot executed last, a one-step stall at
+    every chunk switch.
+    """
+    action_queue_rtc_enabled.merge(sample_actions["short"], sample_actions["short"], real_delay=0)
+    for _ in range(2):
+        action_queue_rtc_enabled.get()
+    index_at_observation = action_queue_rtc_enabled.get_action_index()
+    for _ in range(6):
+        action_queue_rtc_enabled.get()
+
+    action_queue_rtc_enabled.merge(
+        sample_actions["original"],
+        sample_actions["processed"],
+        real_delay=5,
+        action_index_before_inference=index_at_observation,
+    )
+
+    assert action_queue_rtc_enabled.qsize() == 50 - 6
+    torch.testing.assert_close(action_queue_rtc_enabled.get(), sample_actions["processed"][6])
+
+
+def test_snapshot_merge_resumes_at_the_actions_consumed_since_the_snapshot(
+    action_queue_rtc_enabled, sample_actions
+):
+    """The snapshot cursor counts commits across replacements, whatever the estimate says."""
+    action_queue_rtc_enabled.merge(sample_actions["short"], sample_actions["short"], real_delay=0)
+    snapshot = action_queue_rtc_enabled.snapshot()
+    action_queue_rtc_enabled.get()
+    # Replacing the queue re-bases its index, but not the commit cursor.
+    action_queue_rtc_enabled.merge(sample_actions["short"], sample_actions["short"], real_delay=0)
+    action_queue_rtc_enabled.get()
+    action_queue_rtc_enabled.get()
+
+    assert action_queue_rtc_enabled.merge(
+        sample_actions["original"], sample_actions["processed"], real_delay=1, snapshot=snapshot
+    )
+
+    assert action_queue_rtc_enabled.qsize() == 50 - 3
+    torch.testing.assert_close(action_queue_rtc_enabled.get(), sample_actions["processed"][3])
+
+
+def test_merge_without_an_index_skips_the_latency_estimate(action_queue_rtc_enabled, sample_actions):
+    action_queue_rtc_enabled.merge(sample_actions["original"], sample_actions["processed"], real_delay=4)
+
+    assert action_queue_rtc_enabled.qsize() == 46
+
+
 # Thread safety tests
 
 

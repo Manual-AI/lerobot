@@ -430,8 +430,14 @@ class GrootPolicy(PreTrainedPolicy):
             getattr(self._groot_model.config, "action_horizon", self.config.chunk_size)
         )
         max_action_dim = int(getattr(self._groot_model.config, "max_action_dim", self.config.max_action_dim))
-        if prev_actions.shape[1] > model_action_horizon:
-            prev_actions = prev_actions[:, -model_action_horizon:, :]
+        rtc_config = getattr(self.config, "rtc_config", None)
+        execution_horizon = int(getattr(rtc_config, "execution_horizon", model_action_horizon))
+        # Leftover row i is the old plan i steps after this chunk's observation, and the model
+        # copies the *last* `overlap` rows it is handed into new rows [0, overlap). Keep the
+        # head, sized to the overlap, so new row 0 lines up with leftover row 0.
+        overlap_limit = min(model_action_horizon, execution_horizon)
+        if prev_actions.shape[1] > overlap_limit:
+            prev_actions = prev_actions[:, :overlap_limit, :]
 
         action_horizon = int(prev_actions.shape[1])
         if action_horizon <= 0:
@@ -451,17 +457,19 @@ class GrootPolicy(PreTrainedPolicy):
 
         prev_actions = prev_actions.to(device=state.device, dtype=state.dtype)
 
-        rtc_config = getattr(self.config, "rtc_config", None)
-        execution_horizon = int(getattr(rtc_config, "execution_horizon", action_horizon))
-        overlap_steps = max(0, min(action_horizon, execution_horizon))
-        if overlap_steps == 0:
-            return inputs, None
+        overlap_steps = action_horizon
 
         try:
             frozen_steps = int(inference_delay or 0)
         except (TypeError, ValueError):
             frozen_steps = 0
         frozen_steps = max(0, min(frozen_steps, overlap_steps))
+        logger.debug(
+            "GR00T N1.7 RTC: overlap=%d, frozen=%d, blend=%d rows",
+            overlap_steps,
+            frozen_steps,
+            overlap_steps - frozen_steps,
+        )
 
         options: dict[str, object] = {
             "action_horizon": action_horizon,
