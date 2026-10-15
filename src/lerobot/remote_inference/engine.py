@@ -100,6 +100,7 @@ class RemoteInferenceEngine(InferenceEngine):
             blend_steps=config.blend_steps,
             blend_weight=config.blend_weight,
             blend_indices=client.blend_indices,
+            rtc_horizon=client.capabilities.rtc_horizon,
         )
         self._lock = RLock()
         self._observation: ObservationSnapshot | None = None
