@@ -26,6 +26,7 @@ import numpy as np
 import torch
 import torchvision.transforms.v2.functional as tv_functional
 from einops import rearrange
+from huggingface_hub import snapshot_download
 from torchvision.transforms import InterpolationMode
 
 from lerobot.utils.import_utils import _datasets_available, _transformers_available, require_package
@@ -1462,14 +1463,8 @@ def _align_video_horizon(video: np.ndarray, horizon: int | None) -> np.ndarray:
 
 def _build_n1_7_processor(model_name: str = GROOT_N1_7_BACKBONE_MODEL) -> ProcessorMixin:
     require_package("transformers", extra="groot")
-    try:
-        # Each online load re-checks the Hub even when cached (about 2 s for the three, and a
-        # 401 without a token, since the backbone repo is gated), so try the cache first.
-        tokenizer, image_processor, video_processor = _load_n1_7_processor_parts(
-            model_name, local_files_only=True
-        )
-    except (OSError, ValueError):
-        tokenizer, image_processor, video_processor = _load_n1_7_processor_parts(model_name)
+    parts = _load_cached_n1_7_processor_parts(model_name)
+    tokenizer, image_processor, video_processor = parts or _load_n1_7_processor_parts(model_name)
     proc = Qwen3VLProcessor(
         image_processor=image_processor,
         tokenizer=tokenizer,
@@ -1478,6 +1473,24 @@ def _build_n1_7_processor(model_name: str = GROOT_N1_7_BACKBONE_MODEL) -> Proces
     )
     proc.tokenizer.padding_side = "left"
     return proc
+
+
+def _load_cached_n1_7_processor_parts(model_name: str) -> tuple[Any, Any, Any] | None:
+    """Load the processor parts from the local Hub cache without any network access, or None.
+
+    An online load re-checks the Hub for every part even when cached (about 2 s for the three,
+    and a 401 without a token, since the backbone repo is gated). ``local_files_only=True`` is
+    not enough by repo id: ``AutoTokenizer`` still calls ``model_info()`` on the Hub for its
+    Mistral-regex check, and fails without network. A local directory skips that check, so the
+    parts load from the cached snapshot's directory.
+    """
+    try:
+        snapshot = (
+            model_name if Path(model_name).is_dir() else snapshot_download(model_name, local_files_only=True)
+        )
+        return _load_n1_7_processor_parts(snapshot, local_files_only=True)
+    except (OSError, ValueError):  # not cached, or cached without every part
+        return None
 
 
 def _load_n1_7_processor_parts(model_name: str, **kwargs: Any) -> tuple[Any, Any, Any]:
