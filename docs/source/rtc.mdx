@@ -185,8 +185,8 @@ lerobot-rollout \
 ```
 
 For a training-time RTC Pi05 checkpoint, change the mode to `trained`. The
-checkpoint records its maximum supported delay, and rollout validates measured
-latency against it:
+checkpoint records its maximum supported delay, and rollout validates the actions
+executed during each inference against it:
 
 ```bash
 lerobot-rollout \
