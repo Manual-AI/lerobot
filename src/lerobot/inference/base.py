@@ -124,8 +124,9 @@ class InferenceEngine(abc.ABC):
     """Action-production interface with shared task and language-query coordination.
 
     Lifecycle: ``start``/``stop`` own backend resources; ``reset`` clears episode
-    state. Async ``pause`` revokes motion, while ``resume`` permits fresh work.
-    The default pause/resume hooks are no-ops for inline inference.
+    state. ``warmup`` pays first-call costs between ``start`` and the control loop.
+    Async ``pause`` revokes motion, while ``resume`` permits fresh work.
+    The default warmup/pause/resume hooks are no-ops for inline inference.
 
     Actions: sync computes in ``get_action(obs_frame)`` on the control thread.
     Async engines receive owned captures through ``notify_observation`` and
@@ -835,6 +836,13 @@ class InferenceEngine(abc.ABC):
 
     def notify_observation(self, obs: dict) -> None:  # noqa: B027
         """Publish a control-thread capture; async engines copy it before returning. Default: no-op."""
+
+    def warmup(self, observe: Callable[[], dict]) -> None:  # noqa: B027
+        """Pay the policy's one-off first-inference costs before the control loop starts.
+
+        ``observe`` returns a processed robot observation; a backend that warms up calls it
+        once and never commands the robot. Default: no-op, and ``observe`` is never called.
+        """
 
     def pause(self) -> None:  # noqa: B027
         """Revoke async motion without waiting for the worker; caller clears interpolation. Default: no-op."""

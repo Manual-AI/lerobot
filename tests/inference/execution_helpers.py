@@ -33,18 +33,19 @@ class Clock:
         return self.now
 
 
-def runtime(mode=ExecutionMode.CHUNK, max_age=10, training_max_delay=2):
+def runtime(mode=ExecutionMode.CHUNK, max_age=10, training_max_delay=2, **overrides):
     clock = Clock()
-    runtime = ChunkRuntime(
-        mode=mode,
-        action_interval=0.1,
-        refill_seconds=0.3,
-        max_observation_age_s=max_age,
-        action_timeout_s=3,
-        startup_timeout_s=5,
-        training_max_delay=training_max_delay,
-        clock=clock,
-    )
+    settings = {
+        "mode": mode,
+        "action_interval": 0.1,
+        "refill_seconds": 0.3,
+        "max_observation_age_s": max_age,
+        "action_timeout_s": 3,
+        "startup_timeout_s": 5,
+        "training_max_delay": training_max_delay,
+        "clock": clock,
+    }
+    runtime = ChunkRuntime(**(settings | overrides))
     runtime.active = True
     return runtime, clock
 

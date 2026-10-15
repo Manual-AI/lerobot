@@ -45,12 +45,13 @@ class ControlledPolicy:
     drop_queued_actions = PreTrainedPolicy.drop_queued_actions
     _action_queue_attrs = PreTrainedPolicy._action_queue_attrs
 
-    def __init__(self, width: int = 2):
+    def __init__(self, width: int = 2, steps: int = 20):
         self.width = width
+        self.steps = steps
         self.config = SimpleNamespace(
             n_obs_steps=1,
-            chunk_size=20,
-            n_action_steps=20,
+            chunk_size=steps,
+            n_action_steps=steps,
             rtc_training_max_delay=4,
             action_feature=PolicyFeature(type=FeatureType.ACTION, shape=(2,)),
         )
@@ -63,7 +64,7 @@ class ControlledPolicy:
         self.calls.append((prev_chunk_left_over, inference_delay))
         self.action_observations.append(batch["observation.state"].clone())
         assert self.release.acquire(timeout=3), "test must release the model call"
-        return torch.ones(1, 20, self.width)
+        return torch.ones(1, self.steps, self.width)
 
     def generate_text(self, batch):
         self.text_observations.append(batch["observation.state"].clone())

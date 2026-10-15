@@ -21,6 +21,7 @@ import logging
 import math
 import time
 import traceback
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from threading import Event, Lock, Thread
 from typing import Any
@@ -171,6 +172,9 @@ class RTCInferenceEngine(InferenceEngine):
             startup_timeout_s=startup_timeout_s,
             action_starvation_grace_s=action_starvation_grace_s,
             training_max_delay=self._policy_spec.training_max_delay,
+            rtc_horizon=rtc_config.execution_horizon
+            if rtc_config.enabled and rtc_config.prefix_guidance
+            else 0,
         )
         self._runtime.queue.cfg = rtc_config
         self._reset_pending = False
@@ -200,6 +204,10 @@ class RTCInferenceEngine(InferenceEngine):
         self._global_shutdown_event = shutdown_event
         self._rtc_thread: Thread | None = None
         self._started = False
+        # warmup() hands its observation to the RTC thread, which owns the policy.
+        self._warmup_obs: dict | None = None
+        self._warmup_error: BaseException | None = None
+        self._warmup_done = Event()
 
         if not self._use_torch_compile:
             self._compile_warmup_done.set()
@@ -278,6 +286,33 @@ class RTCInferenceEngine(InferenceEngine):
         )
         self._rtc_thread.start()
         logger.info("RTC inference thread started")
+
+    def warmup(self, observe: Callable[[], dict]) -> None:
+        """Run two discarded inferences now, so first-call costs never reach the control loop.
+
+        A policy's first call pays one-off costs (lazily built processors, CUDA kernel
+        selection, allocator growth) that can take seconds: GR00T N1.7 measured 2.7 s against
+        ~0.13 s warm. In the loop that stalls the first chunk. The two calls cover both paths
+        the loop takes: an unguided first chunk, then a chunk conditioned on its head with a
+        nonzero delay. Without torch.compile, the warm second call seeds the executed-delay
+        history. Policy and processor state is reset after, so the rollout starts as if fresh;
+        the action queue is never touched.
+
+        Call after ``start()`` and before ``resume()``. The RTC thread runs the inferences,
+        because it owns the policy. Re-raises a failure here; the engine stays usable.
+        """
+        if self._rtc_thread is None or not self._rtc_thread.is_alive():
+            raise RuntimeError("RTC warmup needs the inference thread: call start() first")
+        obs = observe()
+        self._warmup_error = None
+        self._warmup_done.clear()
+        self._warmup_obs = obs
+        while not self._warmup_done.wait(_RTC_IDLE_SLEEP_S):
+            if self.failed or self._shutdown_event.is_set():
+                self._warmup_obs = None
+                return
+        if self._warmup_error is not None:
+            raise self._warmup_error
 
     def stop(self) -> None:
         """Signal the RTC thread to stop and wait for it."""
@@ -500,6 +535,95 @@ class RTCInferenceEngine(InferenceEngine):
     # RTC: background inference thread
     # ------------------------------------------------------------------
 
+    def _predict(
+        self,
+        features: Mapping[str, Any],
+        task: str,
+        mode: ExecutionMode,
+        delay: int,
+        previous: torch.Tensor | None,
+        canonical_previous: torch.Tensor | None,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Predict one chunk from a captured frame, returning model-space and canonical actions."""
+        batch = prepare_observation_for_inference(
+            {key: value.copy() for key, value in features.items()},
+            device,
+            task,
+            self._robot.robot_type,
+        )
+        batch["task"] = [task]
+        with chunk_inference_context(mode):
+            preprocessed = self._preprocessor(batch)
+            prediction = predict_chunk(
+                self._policy,
+                self._postprocessor,
+                preprocessed,
+                spec=self._policy_spec,
+                mode=mode,
+                canonical_action_dim=self._canonical_action_dim,
+                model_action_dim=self._model_action_dim,
+                device=device,
+                rtc_horizon=self._rtc_config.execution_horizon if self._rtc_config.enabled else 0,
+                inference_delay=delay,
+                model_continuation=previous,
+                canonical_continuation=canonical_previous,
+                relative_step=self._relative_step,
+                normalizer_step=self._normalizer_step,
+                prefix_encoder=self._prefix_encoder,
+                prefix_guidance=self._rtc_config.prefix_guidance,
+            )
+        self._model_action_dim = prediction.model_actions.shape[1]
+        return prediction.model_actions, prediction.canonical_actions
+
+    def _run_warmup(self, obs: dict, device: torch.device) -> None:
+        """Serve ``warmup()`` on the RTC thread: two discarded chunks, then a full reset."""
+        mode = self._runtime.mode
+        task = self.task  # read without consuming the task-changed edge
+        try:
+            features = build_dataset_frame(self._obs_features, obs, prefix="observation")
+            try:
+                start = time.perf_counter()
+                original, processed = self._predict(features, task, mode, 0, None, None, device)
+                first_latency = time.perf_counter() - start
+                # The first chunk's head stands in for a leftover, and a nonzero delay exercises
+                # the prefix the way a real switch does.
+                delay = (
+                    min(1, self._policy_spec.training_max_delay) if mode is ExecutionMode.RTC_TRAINED else 1
+                )
+                start = time.perf_counter()
+                self._predict(features, task, mode, delay, original, processed, device)
+                warm_latency = time.perf_counter() - start
+            finally:
+                self._policy.reset()
+                self._preprocessor.reset()
+                self._postprocessor.reset()
+                rtc_processor = getattr(self._policy, "rtc_processor", None)
+                if rtc_processor is not None:
+                    rtc_processor.reset_tracker()
+            if self._use_torch_compile:
+                # The warm call may still have been compiling; the in-loop compile warmup and
+                # the first counted delays size the prefix instead.
+                self._runtime.seed_delays(None)
+                logger.info(
+                    "RTC warmup done: first inference %.2fs, second %.2fs", first_latency, warm_latency
+                )
+            else:
+                # The executed delay spans the same work, from request to accepted chunk.
+                seed = math.ceil(warm_latency / self._runtime.interval)
+                self._runtime.seed_delays(seed)
+                logger.info(
+                    "RTC warmup done: first inference %.2fs, warm %.2fs; RTC delay seeded at %d steps",
+                    first_latency,
+                    warm_latency,
+                    seed,
+                )
+        except Exception as exc:  # handed to the warmup() caller; the RTC thread stays up
+            self._warmup_error = exc
+        finally:
+            self._warmup_obs = None
+            self._warmup_done.set()
+
     def _rtc_loop(self) -> None:
         """Own all policy/processor mutations and use the shared chunk runtime."""
         try:
@@ -529,6 +653,10 @@ class RTCInferenceEngine(InferenceEngine):
                     self._preprocessor.reset()
                     self._postprocessor.reset()
                     self._language_preprocessor.reset()
+                warmup_obs = self._warmup_obs
+                if warmup_obs is not None:
+                    self._run_warmup(warmup_obs, policy_device)
+                    continue
                 if not self._policy_active.is_set():
                     time.sleep(_RTC_IDLE_SLEEP_S)
                     continue
@@ -595,35 +723,15 @@ class RTCInferenceEngine(InferenceEngine):
                     delay = 0 if inference_count == 1 else 1
                     if self._runtime.mode is ExecutionMode.RTC_TRAINED and delay:
                         delay = min(self._policy_spec.training_max_delay, self._rtc_config.execution_horizon)
-                batch = prepare_observation_for_inference(
-                    {key: value.copy() for key, value in observation.features.items()},
-                    policy_device,
+                original, processed = self._predict(
+                    observation.features,
                     task,
-                    self._robot.robot_type,
+                    request.mode,
+                    delay,
+                    previous,
+                    canonical_previous,
+                    policy_device,
                 )
-                batch["task"] = [task]
-                with chunk_inference_context(request.mode):
-                    preprocessed = self._preprocessor(batch)
-                    prediction = predict_chunk(
-                        self._policy,
-                        self._postprocessor,
-                        preprocessed,
-                        spec=self._policy_spec,
-                        mode=request.mode,
-                        canonical_action_dim=self._canonical_action_dim,
-                        model_action_dim=self._model_action_dim,
-                        device=policy_device,
-                        rtc_horizon=self._rtc_config.execution_horizon if self._rtc_config.enabled else 0,
-                        inference_delay=delay,
-                        model_continuation=previous,
-                        canonical_continuation=canonical_previous,
-                        relative_step=self._relative_step,
-                        normalizer_step=self._normalizer_step,
-                        prefix_encoder=self._prefix_encoder,
-                        prefix_guidance=self._rtc_config.prefix_guidance,
-                    )
-                    original, processed = prediction.model_actions, prediction.canonical_actions
-                    self._model_action_dim = original.shape[1]
                 if inference_count < warmup_required:
                     # Warmup cannot leave motion or processor state for rollout.
                     with self._runtime.lock:

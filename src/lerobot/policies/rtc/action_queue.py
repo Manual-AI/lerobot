@@ -250,18 +250,30 @@ class ActionQueue:
         - RTC enabled: Replaces the queue, accounting for inference delay
         - RTC disabled: Appends to the queue, maintaining continuity
 
+        Row k of an RTC chunk is the action for k steps after the continuation it was
+        conditioned on, so the queue resumes at the row equal to the actions consumed since
+        then. That count is ground truth; ``real_delay`` is only the fallback when neither
+        ``snapshot`` nor ``action_index_before_inference`` identifies where counting starts.
+
         Args:
             original_actions: Unprocessed actions from policy (time_steps, action_dim).
             processed_actions: Post-processed actions for robot (time_steps, action_dim).
-            real_delay: Number of time steps of inference delay.
-            action_index_before_inference: Index before inference started, for validation.
+            real_delay: Inference delay estimated from latency, in time steps.
+            action_index_before_inference: Queue index captured with the continuation, in the
+                current queue contents (no merge or clear since).
             task: Instruction used to generate the incoming action chunk.
+            provenance: Request provenance attached to every merged action.
+            snapshot: Continuation the chunk was conditioned on; its cursor counts the actions
+                consumed since, across merges.
+
+        Returns:
+            bool: False, leaving the queue untouched, if ``snapshot`` predates a ``clear()``.
         """
         with self.lock:
             if snapshot is not None and snapshot.generation != self._generation:
                 return False
             if snapshot is not None:
-                delay = min(max(0, real_delay), max(0, self._cursor - snapshot.cursor))
+                delay = max(0, self._cursor - snapshot.cursor)
             else:
                 delay = self._check_and_resolve_delays(real_delay, action_index_before_inference)
 
@@ -284,8 +296,8 @@ class ActionQueue:
     ) -> Tensor:
         """Replace the queue with new actions (RTC mode).
 
-        Discards the first `real_delay` actions since they correspond to the time
-        spent during inference, when the robot was executing previous actions.
+        Discards the first `real_delay` actions: the robot executed the previous chunk's
+        actions for those steps while this chunk was being computed.
 
         Args:
             original_actions: Unprocessed actions from policy.
@@ -339,30 +351,28 @@ class ActionQueue:
     def _check_and_resolve_delays(
         self, real_delay: int, action_index_before_inference: int | None = None
     ) -> int:
-        """Validate that computed delays match expectations.
+        """Resolve how many actions the robot executed while the new chunk was computed.
 
-        Compares the delay computed from inference latency with the actual
-        number of actions consumed during inference.
+        The actions consumed since ``action_index_before_inference`` are the delay; the
+        latency-based ``real_delay`` is only an estimate (it runs short whenever time passes
+        outside the timed span) and is the fallback when no index was captured. A mismatch is
+        logged so a drifting estimate stays visible.
 
         Args:
-            real_delay: Delay computed from inference latency.
-            action_index_before_inference: Action index when inference started.
+            real_delay: Delay estimated from inference latency.
+            action_index_before_inference: Action index captured with the continuation.
 
         Returns:
             int: Delay to use.
         """
-        effective_delay = max(0, real_delay)
+        if action_index_before_inference is None:
+            return max(0, real_delay)
 
-        if action_index_before_inference is not None:
-            indexes_diff = max(0, self.last_index - action_index_before_inference)
-            if indexes_diff != real_delay:
-                logger.info(
-                    "Indexes diff is not equal to real delay. indexes_diff=%d, real_delay=%d",
-                    indexes_diff,
-                    real_delay,
-                )
-                # Never discard more than was actually consumed, or the queue splices ahead
-                # of the physical pose.
-                return min(real_delay, indexes_diff)
-
-        return effective_delay
+        indexes_diff = max(0, self.last_index - action_index_before_inference)
+        if indexes_diff != real_delay:
+            logger.info(
+                "Indexes diff is not equal to real delay. indexes_diff=%d, real_delay=%d",
+                indexes_diff,
+                real_delay,
+            )
+        return indexes_diff

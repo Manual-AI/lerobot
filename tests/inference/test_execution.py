@@ -14,6 +14,8 @@
 
 """Deterministic timing/continuation tests shared by local and remote execution."""
 
+import logging
+
 import torch
 
 from lerobot.inference import (
@@ -106,6 +108,99 @@ def test_trained_rtc_rejects_unconditioned_actual_progress():
     # covered by a two-step trained prefix.
     clock.now += 0.1
     assert not rt.accept(request, chunk(request), task_version=0)
+
+
+def test_rtc_merge_resumes_at_commits_that_outpace_the_clock():
+    """Two endpoints committed within half an interval: resume at row 2, never row 1.
+
+    Pacing re-anchors every tick, so a slow observation read followed by a fast one commits
+    two endpoints less than an interval apart. Row 1 is the action for an instant the robot
+    already passed: resuming there would send it again.
+    """
+    rt, clock = runtime(ExecutionMode.RTC_GUIDED)
+    first = rt.begin(observation(clock))
+    rt.accept(first, chunk(first), task_version=0)
+    rt.pop()
+    request = rt.begin(observation(clock))
+    rt.pop()
+    rt.pop()
+    clock.now += 0.05
+    assert rt.accept(request, chunk(request, offset=10), task_version=0)
+    assert rt.last_accept["trimmed_actions"] == 2
+    assert rt.pop()[0].item() == 12
+
+
+def test_trained_rtc_accepts_a_chunk_whose_prefix_covers_the_actions_executed():
+    """The prefix must cover what executed, not what the clock says could have."""
+    rt, clock = runtime(ExecutionMode.RTC_TRAINED)
+    initial = rt.begin(observation(clock))
+    rt.accept(initial, chunk(initial, length=5), task_version=0)
+    rt.pop()
+    rt.pop()
+    request = rt.begin(observation(clock))
+    assert request.delay == 2
+    rt.pop()
+    rt.pop()
+    clock.now += 0.45  # five intervals elapsed, but only two actions executed
+    assert rt.accept(request, chunk(request, offset=10, length=5), task_version=0)
+    assert rt.pop()[0].item() == 12
+
+
+def test_rtc_requests_condition_on_actions_executed_during_recent_inferences():
+    rt, clock = runtime(ExecutionMode.RTC_GUIDED)
+    first = rt.begin(observation(clock))
+    rt.accept(first, chunk(first), task_version=0)
+    rt.pop()
+    second = rt.begin(observation(clock))
+    # Nothing executed during the first inference (the queue was empty): no count yet.
+    assert list(rt.delays) == []
+    assert second.delay == 0
+    rt.pop()
+    rt.pop()
+    clock.now += 0.55  # a turnaround estimate would say six steps
+    assert rt.accept(second, chunk(second, offset=10), task_version=0)
+    assert list(rt.delays) == [2]
+    assert rt.begin(observation(clock)).delay == 2
+    # A reset keeps the history: latency does not change between runs.
+    rt.invalidate()
+    assert list(rt.delays) == [2]
+
+
+def test_trained_rtc_retry_conditions_on_what_the_rejected_chunk_overlapped():
+    rt, clock = runtime(ExecutionMode.RTC_TRAINED, training_max_delay=6, refill_seconds=2.0)
+    first = rt.begin(observation(clock))
+    rt.accept(first, chunk(first, length=20), task_version=0)
+    second = rt.begin(observation(clock))
+    assert second.delay == 6  # nothing counted: the checkpoint's capacity
+    rt.pop()
+    rt.pop()
+    assert rt.accept(second, chunk(second, offset=100, length=20), task_version=0)
+    third = rt.begin(observation(clock))
+    assert third.delay == 3  # two executed, plus a step of margin
+    for _ in range(5):
+        rt.pop()
+    assert not rt.accept(third, chunk(third, offset=200, length=20), task_version=0)
+    assert list(rt.delays) == [2, 5]
+    # The robot keeps executing the accepted chunk; the retry covers 5 + 1 steps.
+    assert rt.begin(observation(clock)).delay == 6
+    assert rt.pop()[0].item() == 107
+
+
+def test_guided_delay_covering_the_overlap_warns_once(caplog):
+    rt, clock = runtime(ExecutionMode.RTC_GUIDED, rtc_horizon=3)
+    first = rt.begin(observation(clock))
+    rt.accept(first, chunk(first), task_version=0)
+    rt.pop()
+    rt.seed_delays(3)
+    with caplog.at_level(logging.WARNING, logger="lerobot.inference.execution"):
+        request = rt.begin(observation(clock))
+        assert request.delay == 3
+        rt.accept(request, chunk(request, offset=10, length=6), task_version=0)
+        for _ in range(3):
+            rt.pop()
+        assert rt.begin(observation(clock)) is not None
+    warnings = [r for r in caplog.records if "switch with no blend" in r.getMessage()]
+    assert len(warnings) == 1
 
 
 def test_planned_hold_suppresses_starvation_but_not_resume_startup_deadline():

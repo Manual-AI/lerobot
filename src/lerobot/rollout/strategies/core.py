@@ -90,8 +90,9 @@ class RolloutStrategy(abc.ABC):
         """Attach the inference engine and action interpolator, then start the backend.
 
         Creates an :class:`ActionInterpolator` from the config's
-        ``interpolation_multiplier`` and starts the inference engine.
-        Call this from ``setup()`` so strategies share identical
+        ``interpolation_multiplier``, starts the inference engine and warms it up on one
+        observation, so the policy's first-call costs are paid here rather than by the
+        first chunk of ``run()``. Call this from ``setup()`` so strategies share identical
         initialisation without duplicating code.
         """
         self._interpolator = ActionInterpolator(multiplier=ctx.runtime.cfg.interpolation_multiplier)
@@ -101,6 +102,22 @@ class RolloutStrategy(abc.ABC):
         self._engine.start()
         self._warmup_flushed = False
         logger.info("Inference engine started")
+        self._warm_up_engine(ctx)
+
+    def _warm_up_engine(self, ctx: RolloutContext) -> None:
+        """Run the engine's warm-up on a live observation; the robot is read, never commanded.
+
+        A failure is only logged: the loop then pays the first-call costs itself, as it
+        would without a warm-up.
+        """
+
+        def observe() -> RobotObservation:
+            return ctx.processors.robot_observation_processor(ctx.hardware.robot_wrapper.get_observation())
+
+        try:
+            self._require_engine().warmup(observe)
+        except Exception:
+            logger.warning("Inference engine warm-up failed; continuing without it", exc_info=True)
 
     def _require_engine(self) -> InferenceEngine:
         """The inference engine attached by :meth:`_init_engine`."""
