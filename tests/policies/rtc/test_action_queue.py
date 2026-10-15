@@ -554,6 +554,93 @@ def test_merge_skips_validation_when_action_index_none(action_queue_rtc_enabled,
     assert "Indexes diff is not equal to real delay" not in caplog.text
 
 
+def test_merge_resumes_at_the_actions_executed_not_the_latency_estimate(
+    action_queue_rtc_enabled, sample_actions
+):
+    """6 actions ran during inference but latency estimated 5: the queue must resume at row 6.
+
+    Resuming at row 5 would re-send the action the robot executed last, a one-step stall at
+    every chunk switch.
+    """
+    action_queue_rtc_enabled.merge(sample_actions["short"], sample_actions["short"], real_delay=0)
+    for _ in range(2):
+        action_queue_rtc_enabled.get()
+    index_at_observation = action_queue_rtc_enabled.get_action_index()
+    for _ in range(6):
+        action_queue_rtc_enabled.get()
+
+    executed = action_queue_rtc_enabled.merge(
+        sample_actions["original"],
+        sample_actions["processed"],
+        real_delay=5,
+        action_index_before_inference=index_at_observation,
+    )
+
+    assert executed == 6
+    assert action_queue_rtc_enabled.qsize() == 50 - 6
+    torch.testing.assert_close(action_queue_rtc_enabled.get(), sample_actions["processed"][6])
+
+
+def test_merge_keeps_a_whole_first_chunk_computed_while_the_robot_was_idle(
+    action_queue_rtc_enabled, sample_actions
+):
+    """A slow first inference (82 steps) on an empty queue executed nothing: skip nothing."""
+    index_at_observation = action_queue_rtc_enabled.get_action_index()
+    assert action_queue_rtc_enabled.get() is None  # the control loop polls an empty queue
+
+    executed = action_queue_rtc_enabled.merge(
+        sample_actions["original"],
+        sample_actions["processed"],
+        real_delay=82,
+        action_index_before_inference=index_at_observation,
+    )
+
+    assert executed == 0
+    assert action_queue_rtc_enabled.qsize() == 50
+    torch.testing.assert_close(action_queue_rtc_enabled.get(), sample_actions["processed"][0])
+
+
+def test_merge_returns_the_latency_estimate_without_an_index(action_queue_rtc_enabled, sample_actions):
+    executed = action_queue_rtc_enabled.merge(
+        sample_actions["original"], sample_actions["processed"], real_delay=4
+    )
+
+    assert executed == 4
+    assert action_queue_rtc_enabled.qsize() == 46
+
+
+def test_merge_rejects_a_chunk_whose_executed_delay_exceeds_max_delay(
+    action_queue_rtc_enabled, sample_actions
+):
+    """A trained chunk conditioned on a 3-step prefix is unusable once 4 actions executed."""
+    action_queue_rtc_enabled.merge(sample_actions["short"], sample_actions["short"], real_delay=0)
+    for _ in range(4):
+        action_queue_rtc_enabled.get()
+
+    rejected = action_queue_rtc_enabled.merge(
+        sample_actions["original"],
+        sample_actions["processed"],
+        real_delay=3,
+        action_index_before_inference=0,
+        max_delay=3,
+    )
+
+    assert rejected is None
+    # Untouched: the robot keeps executing the previous chunk.
+    assert action_queue_rtc_enabled.qsize() == 6
+    torch.testing.assert_close(action_queue_rtc_enabled.get(), sample_actions["short"][4])
+
+    accepted = action_queue_rtc_enabled.merge(
+        sample_actions["original"],
+        sample_actions["processed"],
+        real_delay=0,
+        action_index_before_inference=4,
+        max_delay=3,
+    )
+    assert accepted == 1
+    assert action_queue_rtc_enabled.qsize() == 49
+
+
 # Thread safety tests
 
 
@@ -835,8 +922,10 @@ def test_typical_rtc_workflow(action_queue_rtc_enabled, sample_actions):
 
     assert action_queue_rtc_enabled.qsize() == 40
 
-    # Second inference with delay
+    # Second inference, during which the robot executes 5 more actions
     action_index_before = action_queue_rtc_enabled.get_action_index()
+    for _ in range(5):
+        action_queue_rtc_enabled.get()
 
     action_queue_rtc_enabled.merge(
         sample_actions["original"],
@@ -845,7 +934,7 @@ def test_typical_rtc_workflow(action_queue_rtc_enabled, sample_actions):
         action_index_before_inference=action_index_before,
     )
 
-    # Queue should be replaced, minus delay
+    # Queue should be replaced, minus the actions executed during inference
     assert action_queue_rtc_enabled.qsize() == 45
     assert action_queue_rtc_enabled.get_action_index() == 0
 

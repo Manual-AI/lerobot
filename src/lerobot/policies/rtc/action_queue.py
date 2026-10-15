@@ -35,11 +35,16 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class ActionQueueSnapshot:
-    """A cursor and both queue representations captured under one queue lock."""
+    """A cursor and both queue representations captured under one queue lock.
+
+    ``generation`` identifies the queue contents the cursor indexes into: every merge and
+    clear starts a new one, after which ``action_index`` no longer counts the same actions.
+    """
 
     action_index: int
     original_left_over: Tensor | None
     processed_left_over: Tensor | None
+    generation: int = 0
 
 
 class ActionQueue:
@@ -76,6 +81,7 @@ class ActionQueue:
         self._task_queue: list[str | None] | None = None
         self.lock = Lock()
         self.last_index = 0
+        self._generation = 0  # bumped whenever merge()/clear() re-base last_index
         self.cfg = cfg
 
     def get(self) -> Tensor | None:
@@ -113,6 +119,7 @@ class ActionQueue:
             self.original_queue = None
             self._task_queue = None
             self.last_index = 0
+            self._generation += 1
 
     def qsize(self) -> int:
         """Get the number of remaining actions in the queue.
@@ -145,6 +152,11 @@ class ActionQueue:
         with self.lock:
             return self.last_index
 
+    def get_generation(self) -> int:
+        """Get the generation of the queue contents; see :class:`ActionQueueSnapshot`."""
+        with self.lock:
+            return self._generation
+
     def snapshot_for_inference(self) -> ActionQueueSnapshot:
         """Atomically snapshot the cursor and aligned model/robot-space leftovers.
 
@@ -163,6 +175,7 @@ class ActionQueue:
                 action_index=self.last_index,
                 original_left_over=original,
                 processed_left_over=processed,
+                generation=self._generation,
             )
 
     def get_left_over(self) -> Tensor | None:
@@ -200,7 +213,8 @@ class ActionQueue:
         action_index_before_inference: int | None = None,
         *,
         task: str | None = None,
-    ) -> None:
+        max_delay: int | None = None,
+    ) -> int | None:
         """Merge new actions into the queue.
 
         This method operates differently based on RTC mode:
@@ -210,18 +224,31 @@ class ActionQueue:
         Args:
             original_actions: Unprocessed actions from policy (time_steps, action_dim).
             processed_actions: Post-processed actions for robot (time_steps, action_dim).
-            real_delay: Number of time steps of inference delay.
-            action_index_before_inference: Index before inference started, for validation.
+            real_delay: Inference delay estimated from latency, in time steps. Used only when
+                ``action_index_before_inference`` is None.
+            action_index_before_inference: Queue index captured with the observation the chunk
+                was predicted from, in the current generation (no merge or clear since). The
+                actions consumed since then are the delay.
             task: Instruction used to generate the incoming action chunk.
+            max_delay: Reject the chunk, leaving the queue untouched, if the delay exceeds this.
+                Decided under the queue lock, so the check and the skip use the same count.
+
+        Returns:
+            int | None: The delay used, i.e. the actions the robot executed while the chunk was
+            computed (RTC mode skips that many leading rows), or None if ``max_delay`` rejected
+            the chunk.
         """
         with self.lock:
             delay = self._check_and_resolve_delays(real_delay, action_index_before_inference)
+            if max_delay is not None and delay > max_delay:
+                return None
 
             if self.cfg.enabled:
                 self._replace_actions_queue(original_actions, processed_actions, delay, task)
-                return
-
-            self._append_actions_queue(original_actions, processed_actions, task)
+            else:
+                self._append_actions_queue(original_actions, processed_actions, task)
+            self._generation += 1
+            return delay
 
     def _replace_actions_queue(
         self,
@@ -232,8 +259,8 @@ class ActionQueue:
     ):
         """Replace the queue with new actions (RTC mode).
 
-        Discards the first `real_delay` actions since they correspond to the time
-        spent during inference, when the robot was executing previous actions.
+        Discards the first `real_delay` actions: the robot executed the previous chunk's
+        actions for those steps while this chunk was being computed.
 
         Args:
             original_actions: Unprocessed actions from policy.
@@ -282,28 +309,29 @@ class ActionQueue:
     def _check_and_resolve_delays(
         self, real_delay: int, action_index_before_inference: int | None = None
     ) -> int:
-        """Validate that computed delays match expectations.
+        """Resolve how many actions the robot executed while the new chunk was computed.
 
-        Compares the delay computed from inference latency with the actual
-        number of actions consumed during inference.
+        Row k of the new chunk is the action for k steps after its observation, so the queue
+        must resume at the row equal to the actions consumed since that observation. That
+        count is ground truth; the latency-based ``real_delay`` is only an estimate (it runs
+        short whenever time passes outside the timed span) and is the fallback when no index
+        was captured. A mismatch is logged so a drifting estimate stays visible.
 
         Args:
-            real_delay: Delay computed from inference latency.
-            action_index_before_inference: Action index when inference started.
+            real_delay: Delay estimated from inference latency.
+            action_index_before_inference: Action index captured with the observation.
 
         Returns:
             int: Delay to use.
         """
-        effective_delay = max(0, real_delay)
+        if action_index_before_inference is None:
+            return max(0, real_delay)
 
-        if action_index_before_inference is not None:
-            indexes_diff = max(0, self.last_index - action_index_before_inference)
-            if indexes_diff != real_delay:
-                logger.info(
-                    "Indexes diff is not equal to real delay. indexes_diff=%d, real_delay=%d",
-                    indexes_diff,
-                    real_delay,
-                )
-                return real_delay
-
-        return effective_delay
+        indexes_diff = max(0, self.last_index - action_index_before_inference)
+        if indexes_diff != real_delay:
+            logger.info(
+                "Indexes diff is not equal to real delay. indexes_diff=%d, real_delay=%d",
+                indexes_diff,
+                real_delay,
+            )
+        return indexes_diff

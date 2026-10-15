@@ -442,15 +442,17 @@ def test_groot_predict_action_chunk_forwards_n1_7_rtc_prefix(monkeypatch):
     )
 
     assert actions.shape == (1, 40, 7)
+    # The leftover is longer than the overlap: its head is what lines up with the new chunk's
+    # first rows, so only the first `execution_horizon` rows are handed over.
     assert dummy_model.get_action_options == {
-        "action_horizon": 8,
+        "action_horizon": 6,
         "rtc_overlap_steps": 6,
         "rtc_frozen_steps": 3,
         "rtc_ramp_rate": 6.0,
     }
-    assert dummy_model.forward_inputs["action"].shape == (1, 8, 132)
-    torch.testing.assert_close(dummy_model.forward_inputs["action"][0, :, :7], prev_chunk)
-    torch.testing.assert_close(dummy_model.forward_inputs["action"][0, :, 7:], torch.zeros(8, 125))
+    assert dummy_model.forward_inputs["action"].shape == (1, 6, 132)
+    torch.testing.assert_close(dummy_model.forward_inputs["action"][0, :, :7], prev_chunk[:6])
+    torch.testing.assert_close(dummy_model.forward_inputs["action"][0, :, 7:], torch.zeros(6, 125))
 
 
 def test_groot_predict_action_chunk_strips_padded_n1_7_rtc_prefix(monkeypatch):
@@ -2456,10 +2458,77 @@ def test_groot_n1_7_processor_uses_qwen_component_assets(monkeypatch):
         ("image_processor", "nvidia/Cosmos-Reason2-2B"),
         ("video_processor", "nvidia/Cosmos-Reason2-2B"),
     ]
-    assert all(call[2] == {"trust_remote_code": True} for call in calls)
+    # Cached components load without a Hub round trip.
+    assert all(call[2] == {"trust_remote_code": True, "local_files_only": True} for call in calls)
     assert processor.tokenizer.padding_side == "left"
     assert processor.chat_template == "fake-chat-template"
     assert not FakeProcessor.from_pretrained_called
+
+
+def test_groot_n1_7_processor_falls_back_to_the_hub_when_not_cached(monkeypatch):
+    pytest.importorskip("transformers")
+
+    from lerobot.policies.groot import processor_groot
+
+    calls = []
+
+    def fake_component(name):
+        class FakeComponent:
+            chat_template = "fake-chat-template"
+            padding_side = "right"
+
+            @classmethod
+            def from_pretrained(cls, model_name, **kwargs):
+                calls.append((name, kwargs.get("local_files_only", False)))
+                if kwargs.get("local_files_only") and name == "video_processor":
+                    raise OSError("not in the local cache")
+                return cls()
+
+        return FakeComponent
+
+    class FakeProcessor:
+        def __init__(self, *, image_processor, tokenizer, video_processor, chat_template):
+            self.tokenizer = tokenizer
+
+    monkeypatch.setattr(processor_groot, "AutoTokenizer", fake_component("tokenizer"))
+    monkeypatch.setattr(processor_groot, "Qwen2VLImageProcessor", fake_component("image_processor"))
+    monkeypatch.setattr(processor_groot, "Qwen3VLVideoProcessor", fake_component("video_processor"))
+    monkeypatch.setattr(processor_groot, "Qwen3VLProcessor", FakeProcessor)
+
+    processor_groot._build_n1_7_processor("nvidia/Cosmos-Reason2-2B")
+
+    # One component missing from the cache reloads all three online, so they stay consistent.
+    assert calls == [
+        ("tokenizer", True),
+        ("image_processor", True),
+        ("video_processor", True),
+        ("tokenizer", False),
+        ("image_processor", False),
+        ("video_processor", False),
+    ]
+
+
+def test_groot_rtc_inputs_keep_the_head_of_a_leftover_longer_than_the_model_horizon():
+    """Leftover row 0 is the action at this chunk's observation, so it must stay new row 0."""
+    policy = object.__new__(GrootPolicy)
+    policy.config = SimpleNamespace(
+        use_relative_actions=False,
+        chunk_size=8,
+        max_action_dim=132,
+        rtc_config=SimpleNamespace(execution_horizon=50),
+    )
+    policy._groot_model = SimpleNamespace(config=SimpleNamespace(action_horizon=4, max_action_dim=132))
+    prefix = torch.arange(6 * 6, dtype=torch.float32).view(6, 6) + 1.0
+
+    output_inputs, options = policy._prepare_n1_7_rtc_inputs(
+        {"state": torch.zeros(1, 1, 132)},
+        inference_delay=2,
+        prev_chunk_left_over=prefix,
+    )
+
+    assert options["action_horizon"] == 4
+    assert options["rtc_overlap_steps"] == 4
+    torch.testing.assert_close(output_inputs["action"][0, :, :6], prefix[:4])
 
 
 def test_groot_n1_7_saved_processors_reload_through_factory(tmp_path):
