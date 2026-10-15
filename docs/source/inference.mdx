@@ -312,6 +312,8 @@ lerobot-rollout \
 
 `prefix_guidance=false` is a guided-mode ablation. Trained RTC requires its hard prefix and rejects this combination.
 
+The inference delay is counted, not timed. Each new chunk resumes at the row matching the actions the robot executed while it was being computed, and trained RTC discards a chunk once that count outruns its prefix. The `inference_delay` passed to the next chunk is the largest such count over the last 10 chunks, so one slow inference ages out; until a chunk has been counted, the measured turnaround stands in. Trained RTC adds one step of margin. Before the control loop starts, the engine runs two discarded inferences on a live observation, one unguided and one conditioned on a prefix, then resets the policy. That way a first call's one-off costs (lazy processor builds, CUDA warm-up) neither stall the first chunk nor inflate the delay. The blend region is `execution_horizon` minus the delay: when the delay reaches `execution_horizon` (or the number of leftover actions), chunks switch with no blend, and the engine warns once.
+
 See the [Real-Time Chunking](./rtc) guide for details on tuning RTC parameters.
 
 Local RTC runs in a background thread in the rollout process, without transport. A
