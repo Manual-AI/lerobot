@@ -171,6 +171,8 @@ def test_parity_cases_cover_the_registry():
     assert set(PARITY_EXPECTED) == set(PARITY_KWARGS)
     assert set(PARITY_EXPECTED) | LEROBOT_ONLY == set(tf._BATCHED_TRANSFORMS)  # noqa: SLF001
     assert not set(PARITY_EXPECTED) & LEROBOT_ONLY
+    # The bare names that build LeRobot's copy without a warning must each have a parity case.
+    assert set(PARITY_EXPECTED) >= tf._TORCHVISION_EQUIVALENTS  # noqa: SLF001
 
 
 @pytest.mark.parametrize("type_name", sorted(PARITY_EXPECTED))

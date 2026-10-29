@@ -46,6 +46,7 @@ from .transforms import (
     JPEGCompression,
     PerSampleTransform,
     make_batched_transform_from_config,
+    register_image_transform,
 )
 
 # An example of transforms effects can be found in: https://github.com/huggingface/lerobot/pull/4210
@@ -82,4 +83,5 @@ __all__ = [
     "SharpnessJitter",
     "make_batched_transform_from_config",
     "make_transform_from_config",
+    "register_image_transform",
 ]

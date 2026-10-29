@@ -23,6 +23,7 @@ from torchvision.transforms.v2 import functional as F  # noqa: N812
 
 pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
 
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.scripts.lerobot_imgtransform_viz import (
     save_all_transforms,
     save_each_transform,
@@ -33,6 +34,7 @@ from lerobot.transforms import (
     BatchedGaussianNoise,
     BatchedGaussianPatchBrightness,
     BatchedIdentity,
+    BatchedImageTransforms,
     BatchedMotionBlur,
     BatchedPlanckianJitter,
     BatchedRandomAffine,
@@ -46,7 +48,9 @@ from lerobot.transforms import (
     JPEGCompression,
     PerSampleTransform,
     make_batched_transform_from_config,
+    make_transform_from_config,
 )
+from lerobot.transforms.transforms import _BATCHED_TRANSFORMS, _PER_SAMPLE_TRANSFORMS
 from lerobot.utils.random_utils import seeded_context
 from tests.artifacts.image_transforms.save_image_transforms_to_safetensors import ARTIFACT_DIR
 from tests.utils import require_x86_64_kernel
@@ -514,15 +518,6 @@ def test_robotics_transform_float_output(name, cls, kwargs, img_tensor_factory):
 
 
 @pytest.mark.parametrize("name,cls,kwargs", ROBOTICS_TRANSFORMS, ids=[t[0] for t in ROBOTICS_TRANSFORMS])
-def test_robotics_transform_applies_to_uint8(name, cls, kwargs):
-    """uint8 frames, as the DataLoader workers see them, are transformed and handed back as uint8."""
-    int_img = torch.randint(0, 255, (3, 32, 32), dtype=torch.uint8)
-    out = _single(ImageTransformConfig(type=name, kwargs=kwargs))(int_img)
-    assert out.dtype == torch.uint8 and out.shape == int_img.shape
-    assert not torch.equal(out, int_img), f"{name} left uint8 input untouched"
-
-
-@pytest.mark.parametrize("name,cls,kwargs", ROBOTICS_TRANSFORMS, ids=[t[0] for t in ROBOTICS_TRANSFORMS])
 def test_robotics_transform_via_config(name, cls, kwargs):
     cfg = ImageTransformConfig(type=name, kwargs=kwargs)
     tf = make_batched_transform_from_config(cfg)
@@ -665,3 +660,79 @@ def test_robotics_transform_rejects_invalid_config(cls, kwargs):
 def test_robotics_transform_rejects_wrong_argument_types(cls, kwargs):
     with pytest.raises(TypeError):
         cls(**kwargs)
+
+
+# --- uint8 frames, as the DataLoader workers decode them ---
+
+# For every registered transform but `Identity`, kwargs whose every draw changes a textured frame.
+UINT8_KWARGS: dict[str, dict] = {
+    "ColorJitter": {
+        "brightness": (0.5, 0.8),
+        "contrast": (1.2, 1.5),
+        "saturation": (1.2, 1.5),
+        "hue": (0.1, 0.2),
+    },
+    "RandomAffine": {"degrees": (15.0, 30.0), "translate": (0.1, 0.1)},
+    "RandomRotation": {"degrees": (15.0, 30.0)},
+    "SharpnessJitter": {"sharpness": (0.0, 0.5)},
+    "GaussianNoise": {"std": (5.0, 25.0)},
+    "MotionBlur": {"kernel_size": (3, 11)},
+    "GaussianPatchBrightness": {"sigma_range": (0.1, 0.25), "factor_range": (0.4, 0.7)},
+    "RandomShadow": {"opacity": (0.3, 0.6)},
+    "CoarseDropout": {"max_holes": 8, "max_height_frac": 0.25, "max_width_frac": 0.25},
+    "GammaCorrection": {"gamma": (1.5, 2.0)},
+    "PlanckianJitter": {"temperature": (3_000, 4_000)},
+    "JPEGCompression": {"quality": (5, 50)},
+}
+
+
+def _batched_single(tf_cfg: ImageTransformConfig) -> BatchedImageTransforms:
+    return BatchedImageTransforms(
+        ImageTransformsConfig(enable=True, max_num_transforms=1, tfs={"only": tf_cfg})
+    )
+
+
+def _deprecated_single(tf_cfg: ImageTransformConfig):
+    with pytest.warns(FutureWarning):
+        return make_transform_from_config(tf_cfg)
+
+
+def test_uint8_kwargs_cover_registry():
+    assert set(UINT8_KWARGS) == (set(_BATCHED_TRANSFORMS) | set(_PER_SAMPLE_TRANSFORMS)) - {"Identity"}
+
+
+@pytest.mark.parametrize("name", [*sorted(UINT8_KWARGS), "Identity"])
+@pytest.mark.parametrize(
+    "build,shape",
+    [(_single, (3, 32, 32)), (_batched_single, (2, 3, 32, 32)), (_deprecated_single, (3, 32, 32))],
+    ids=["ImageTransforms", "BatchedImageTransforms", "make_transform_from_config"],
+)
+def test_uint8_frames_change(build, shape, name):
+    """Every entry point transforms uint8 frames and hands them back as uint8."""
+    img = torch.randint(0, 256, shape, dtype=torch.uint8, generator=torch.Generator().manual_seed(0))
+    transform = build(ImageTransformConfig(type=name, kwargs=UINT8_KWARGS.get(name, {})))
+    with seeded_context(0):
+        out = transform(img)
+    assert out.dtype == torch.uint8 and out.shape == img.shape
+    if name == "Identity":
+        assert torch.equal(out, img)
+    else:
+        frames = zip(out.reshape(-1, *shape[-3:]), img.reshape(-1, *shape[-3:]), strict=True)
+        assert all(not torch.equal(o, i) for o, i in frames), f"{name} left a uint8 frame untouched"
+
+
+@pytest.mark.parametrize("name", ["GaussianNoise", "JPEGCompression"])
+def test_dataset_uint8_frames_are_augmented(tmp_path, lerobot_dataset_factory, name):
+    """A dataset decoding uint8 video frames hands them to the transforms and returns them augmented."""
+    image_transforms = _single(ImageTransformConfig(type=name, kwargs=UINT8_KWARGS[name]))
+    dataset = lerobot_dataset_factory(
+        root=tmp_path, use_videos=True, return_uint8=True, image_transforms=image_transforms
+    )
+    raw_dataset = LeRobotDataset(dataset.repo_id, root=tmp_path, return_uint8=True)
+    camera_key = dataset.meta.camera_keys[0]
+    with seeded_context(0):
+        augmented = dataset[0][camera_key]
+    raw = raw_dataset[0][camera_key]
+    assert augmented.dtype == raw.dtype == torch.uint8
+    assert augmented.shape == raw.shape
+    assert not torch.equal(augmented, raw)
