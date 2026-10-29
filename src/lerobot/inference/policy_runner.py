@@ -46,7 +46,7 @@ from .contracts import (
     PolicyCapabilities,
     QueryKind,
 )
-from .prediction import chunk_inference_context, predict_chunk
+from .prediction import chunk_inference_context, find_relative_rtc_prefix_encoder, predict_chunk
 
 
 class PolicyRunner:
@@ -137,6 +137,8 @@ class PolicyRunner:
         self._normalizer_step = next(
             (step for step in preprocessor.steps if isinstance(step, NormalizerProcessorStep)), None
         )
+        self._prefix_encoder = find_relative_rtc_prefix_encoder(preprocessor)
+        self._prefix_guidance = rtc_config is None or rtc_config.prefix_guidance
         # Chunk callers never use select_action's private playback queue. A prior
         # sync binding must not hold an old anchor across complete chunk calls.
         if self._relative_step is not None:
@@ -258,6 +260,8 @@ class PolicyRunner:
                 canonical_continuation=canonical_continuation,
                 relative_step=self._relative_step,
                 normalizer_step=self._normalizer_step,
+                prefix_encoder=self._prefix_encoder,
+                prefix_guidance=self._prefix_guidance,
             )
             self._model_action_dim = prediction.model_actions.shape[1]
             self.capabilities = replace(self.capabilities, model_action_dim=self._model_action_dim)

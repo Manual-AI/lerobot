@@ -74,6 +74,10 @@ class RTCConfig:
     prefix_attention_schedule: RTCAttentionSchedule = RTCAttentionSchedule.LINEAR
     max_guidance_weight: float = 10.0
     execution_horizon: int = 10
+    # Set to False to keep asynchronous chunk replacement but stop conditioning each chunk on
+    # the previous one's unexecuted tail. This allows comparing guided and unguided
+    # chunk replacement while preserving asynchronous chunk production.
+    prefix_guidance: bool = True
 
     # Debug settings
     debug: bool = False
@@ -83,6 +87,11 @@ class RTCConfig:
         """Validate RTC configuration parameters."""
         if self.mode not in {"guided", "trained"}:
             raise ValueError(f"mode must be 'guided' or 'trained', got {self.mode!r}")
+        if self.enabled and self.mode == "trained" and not self.prefix_guidance:
+            raise ValueError(
+                "RTC mode='trained' requires prefix_guidance=True; use mode='guided' with "
+                "prefix_guidance=False for an unguided latency-hiding ablation."
+            )
         if self.max_guidance_weight <= 0:
             raise ValueError(f"max_guidance_weight must be positive, got {self.max_guidance_weight}")
         if self.debug_maxlen <= 0:

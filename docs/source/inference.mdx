@@ -306,8 +306,11 @@ lerobot-rollout \
 | `--inference.rtc.mode`                      | `guided` (default) or trained-prefix `trained` for compatible Pi05 checkpoints                      |
 | `--inference.rtc.max_guidance_weight`       | Consistency enforcement strength (default: varies by policy)                                        |
 | `--inference.rtc.prefix_attention_schedule` | Blend schedule: `LINEAR`, `EXP`, `ONES`, `ZEROS`                                                    |
+| `--inference.rtc.prefix_guidance`           | Condition chunks on the previous chunk's tail (default: true)                                       |
 | `--inference.queue_threshold`               | Backpressure threshold; trained RTC requires at least its maximum delay                             |
 | `--inference.action_starvation_grace_s`     | Wait for fresh motion after starvation on a supported robot (default `1.0`; `0` faults immediately) |
+
+`prefix_guidance=false` is a guided-mode ablation. Trained RTC requires its hard prefix and rejects this combination.
 
 See the [Real-Time Chunking](./rtc) guide for details on tuning RTC parameters.
 

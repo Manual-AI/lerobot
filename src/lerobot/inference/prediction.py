@@ -24,20 +24,42 @@ from typing import Any, Protocol, cast
 
 import torch
 
-from lerobot.policies import PreTrainedPolicy, reanchor_relative_rtc_prefix
+from lerobot.policies import PreTrainedPolicy, RelativeRTCPrefixEncoder, reanchor_relative_rtc_prefix
 from lerobot.processor import NormalizerProcessorStep, PolicyProcessorPipeline, RelativeActionsProcessorStep
 
 from .contracts import ChunkPolicySpec, ExecutionMode
 
 
 class _RTCPredictActionChunk(Protocol):
+    # Only policies whose preprocessor encodes its own relative prefix
+    # (``RelativeRTCPrefixEncoder``) receive ``prev_chunk_left_over_reanchored``.
     def __call__(
         self,
         batch: dict[str, Any],
         *,
         inference_delay: int,
         prev_chunk_left_over: torch.Tensor | None,
+        prev_chunk_left_over_reanchored: bool = ...,
     ) -> torch.Tensor: ...
+
+
+def find_relative_rtc_prefix_encoder(
+    preprocessor: PolicyProcessorPipeline,
+) -> RelativeRTCPrefixEncoder | None:
+    """Return the preprocessor step that encodes this policy's relative RTC prefix, if any.
+
+    Such policies (GR00T N1.7's per-horizon stats rows and SE(3) end-effector deltas)
+    re-anchor the canonical continuation themselves instead of using the generic
+    ``RelativeActionsProcessorStep`` path.
+    """
+    return next(
+        (
+            step
+            for step in preprocessor.steps
+            if isinstance(step, RelativeRTCPrefixEncoder) and step.uses_relative_rtc_prefix()
+        ),
+        None,
+    )
 
 
 @contextmanager
@@ -64,6 +86,50 @@ class ChunkPrediction:
     predicted_at: float
 
 
+def _encode_relative_continuation(
+    canonical: torch.Tensor | None,
+    *,
+    steps: int,
+    model_action_dim: int,
+    horizon: int,
+    device: str | torch.device,
+    prefix_encoder: RelativeRTCPrefixEncoder,
+) -> torch.Tensor | None:
+    """Re-anchor the canonical continuation through the policy's own prefix encoder.
+
+    Must run after preprocessing, so the encoder re-anchors against the state of the
+    observation this chunk is predicted from. Returns ``None`` when the encoder declines,
+    in which case the chunk is predicted without prefix guidance.
+
+    Only the real continuation rows are encoded, without padding a short tail up to
+    ``horizon``: policies that own their prefix (GR00T N1.7's native action overlap)
+    treat every row as a hard constraint, so padded hold rows would pin the new chunk
+    in place, while a shorter prefix only shortens the overlap.
+    """
+    if (
+        canonical is None
+        or canonical.ndim != 2
+        or len(canonical) != steps
+        or not canonical.is_floating_point()
+        or not torch.isfinite(canonical).all()
+    ):
+        raise ValueError("Relative RTC requires a row-aligned finite canonical continuation.")
+    encoded = prefix_encoder.encode_absolute_rtc_prefix(canonical[:horizon])
+    if encoded is None:
+        return None
+    if encoded.ndim == 3 and encoded.shape[0] == 1:
+        encoded = encoded[0]
+    if (
+        encoded.ndim != 2
+        or not 0 < len(encoded) <= horizon
+        or encoded.shape[1] != model_action_dim
+        or not encoded.is_floating_point()
+        or not torch.isfinite(encoded).all()
+    ):
+        raise ValueError("Relative RTC prefix encoder returned an invalid model-space prefix.")
+    return encoded.to(device)
+
+
 def _prepare_continuation(
     model: torch.Tensor | None,
     canonical: torch.Tensor | None,
@@ -73,6 +139,7 @@ def _prepare_continuation(
     device: str | torch.device,
     relative_step: RelativeActionsProcessorStep | None,
     normalizer_step: NormalizerProcessorStep | None,
+    prefix_encoder: RelativeRTCPrefixEncoder | None = None,
 ) -> torch.Tensor | None:
     if model is None or model.numel() == 0:
         return None
@@ -83,6 +150,17 @@ def _prepare_continuation(
         or not torch.isfinite(model).all()
     ):
         raise ValueError("Invalid model-space continuation.")
+    if prefix_encoder is not None:
+        # The model-space rows are deltas against the previous observation; only the
+        # canonical (absolute) tail can be re-anchored to this one.
+        return _encode_relative_continuation(
+            canonical,
+            steps=len(model),
+            model_action_dim=model_action_dim,
+            horizon=horizon,
+            device=device,
+            prefix_encoder=prefix_encoder,
+        )
     if relative_step is not None:
         if canonical is None or canonical.shape != model.shape or not torch.isfinite(canonical).all():
             raise ValueError("Relative RTC requires matching finite canonical continuation.")
@@ -113,16 +191,26 @@ def predict_chunk(
     canonical_continuation: torch.Tensor | None = None,
     relative_step: RelativeActionsProcessorStep | None = None,
     normalizer_step: NormalizerProcessorStep | None = None,
+    prefix_encoder: RelativeRTCPrefixEncoder | None = None,
+    prefix_guidance: bool = True,
 ) -> ChunkPrediction:
     """Predict and validate under exclusive policy/processor ownership.
 
     Retain the first model width across calls. Canonical postprocessing may crop
-    padding; relative RTC requires matching widths. This function owns no scheduling.
+    padding; relative RTC requires matching widths unless ``prefix_encoder`` encodes
+    the prefix. ``prefix_guidance=False`` predicts RTC chunks without conditioning on
+    the continuation. This function owns no scheduling.
     """
     with chunk_inference_context(mode):
         if mode is ExecutionMode.CHUNK:
             predicted = policy.predict_action_chunk(prepared)
         else:
+            if not prefix_guidance:
+                if mode is ExecutionMode.RTC_TRAINED:
+                    raise ValueError("Trained RTC requires prefix guidance.")
+                # Ablation: keep asynchronous chunk replacement, drop prefix conditioning.
+                model_continuation = canonical_continuation = None
+                inference_delay = 0
             prefix = _prepare_continuation(
                 model_continuation,
                 canonical_continuation,
@@ -131,9 +219,21 @@ def predict_chunk(
                 device=device,
                 relative_step=relative_step,
                 normalizer_step=normalizer_step,
+                prefix_encoder=prefix_encoder,
             )
             if inference_delay < 0:
                 raise ValueError("RTC delay must be nonnegative.")
+            refused = (
+                prefix is None
+                and prefix_encoder is not None
+                and model_continuation is not None
+                and model_continuation.numel() > 0
+            )
+            if refused:
+                # The encoder declined this continuation: predict unguided, so neither the
+                # delay nor trained-mode limits may refer to the refused prefix.
+                model_continuation = None
+                inference_delay = 0
             if prefix is None and inference_delay:
                 raise ValueError("RTC delay requires a real continuation prefix.")
             if mode is ExecutionMode.RTC_TRAINED:
@@ -141,7 +241,15 @@ def predict_chunk(
                 if inference_delay > min(spec.training_max_delay, available, rtc_horizon):
                     raise ValueError("Trained RTC delay exceeds checkpoint or available continuation limits.")
             predict = cast(_RTCPredictActionChunk, policy.predict_action_chunk)
-            predicted = predict(prepared, inference_delay=inference_delay, prev_chunk_left_over=prefix)
+            if prefix is not None and prefix_encoder is not None:
+                predicted = predict(
+                    prepared,
+                    inference_delay=inference_delay,
+                    prev_chunk_left_over=prefix,
+                    prev_chunk_left_over_reanchored=True,
+                )
+            else:
+                predicted = predict(prepared, inference_delay=inference_delay, prev_chunk_left_over=prefix)
         predicted_at = time.perf_counter()
         if (
             not isinstance(predicted, torch.Tensor)

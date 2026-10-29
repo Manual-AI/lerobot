@@ -46,7 +46,7 @@ from .contracts import (
     QueryKind,
 )
 from .execution import ChunkRuntime, HoldState
-from .prediction import chunk_inference_context, predict_chunk
+from .prediction import chunk_inference_context, find_relative_rtc_prefix_encoder, predict_chunk
 
 logger = logging.getLogger(__name__)
 
@@ -219,6 +219,12 @@ class RTCInferenceEngine(InferenceEngine):
             (s for s in preprocessor.steps if isinstance(s, NormalizerProcessorStep)),
             None,
         )
+        self._prefix_encoder = find_relative_rtc_prefix_encoder(preprocessor)
+        if self._prefix_encoder is not None:
+            logger.info(
+                "Native relative-action RTC prefix enabled: %s will re-anchor absolute leftovers",
+                type(self._prefix_encoder).__name__,
+            )
         if self._relative_step is not None:
             if self._relative_step.action_names is None:
                 cfg_names = getattr(policy.config, "action_feature_names", None)
@@ -613,6 +619,8 @@ class RTCInferenceEngine(InferenceEngine):
                         canonical_continuation=canonical_previous,
                         relative_step=self._relative_step,
                         normalizer_step=self._normalizer_step,
+                        prefix_encoder=self._prefix_encoder,
+                        prefix_guidance=self._rtc_config.prefix_guidance,
                     )
                     original, processed = prediction.model_actions, prediction.canonical_actions
                     self._model_action_dim = original.shape[1]

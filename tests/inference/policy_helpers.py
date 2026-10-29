@@ -56,7 +56,7 @@ def tiny_config(**kwargs):
     )
 
 
-def processors(config, relative=False):
+def processors(config, relative=False, extra_steps=()):
     stats = {
         OBS_STATE: {"mean": torch.zeros(3), "std": torch.ones(3)},
         ACTION: {"mean": torch.tensor([1.0, 2.0, 3.0]), "std": torch.ones(3) * 2},
@@ -66,13 +66,14 @@ def processors(config, relative=False):
         step = RelativeActionsProcessorStep(enabled=True)
         pre.steps.insert(3, step)
         post.steps.insert(1, AbsoluteActionsProcessorStep(enabled=True, relative_step=step))
+    pre.steps.extend(extra_steps)
     return pre, post
 
 
-def runner_for(policy, *, relative=False, modes=(ExecutionMode.CHUNK,), **kwargs):
+def runner_for(policy, *, relative=False, modes=(ExecutionMode.CHUNK,), extra_steps=(), **kwargs):
     return PolicyRunner(
         policy,
-        *processors(policy.config, relative=relative),
+        *processors(policy.config, relative=relative, extra_steps=extra_steps),
         action_interval=1 / 30,
         features=tuple(
             FeatureSpec(key, (3,), "float32", semantics="joint positions in radians")
@@ -84,7 +85,7 @@ def runner_for(policy, *, relative=False, modes=(ExecutionMode.CHUNK,), **kwargs
     )
 
 
-def local_engine_for(policy, *, relative=False, rtc_config=None, queue_threshold=4):
+def local_engine_for(policy, *, relative=False, rtc_config=None, queue_threshold=4, extra_steps=()):
     pytest.importorskip("datasets")
     from lerobot.inference import RTCInferenceEngine
 
@@ -92,7 +93,7 @@ def local_engine_for(policy, *, relative=False, rtc_config=None, queue_threshold
     env_names = ("env_a", "env_b", "env_c")
     return RTCInferenceEngine(
         policy,
-        *processors(policy.config, relative=relative),
+        *processors(policy.config, relative=relative, extra_steps=extra_steps),
         robot_wrapper=SimpleNamespace(robot_type="test", action_features=dict.fromkeys(state_names, float)),
         rtc_config=rtc_config or policy.config.rtc_config,
         dataset_features={
