@@ -24,10 +24,8 @@ import torch
 from torch import Tensor, nn
 from torchvision.io import decode_image, encode_jpeg
 from torchvision.transforms import InterpolationMode, v2
-from torchvision.transforms.v2 import (
-    Transform,
-    functional as F,  # noqa: N812
-)
+from torchvision.transforms.functional import _interpolation_modes_from_int
+from torchvision.transforms.v2 import Transform
 
 logger = logging.getLogger(__name__)
 
@@ -177,7 +175,8 @@ def _check_angle(value: float | Sequence[float], name: str) -> tuple[float, floa
 
 def _check_interpolation(interpolation: InterpolationMode | int | str) -> str:
     if isinstance(interpolation, int):
-        interpolation = F._utils._interpolation_modes_from_int(interpolation)  # noqa: SLF001
+        # A Pillow integer constant, converted the way torchvision.transforms.v2 converts it.
+        interpolation = _interpolation_modes_from_int(interpolation)
     mode = InterpolationMode(interpolation).value
     if mode not in ("nearest", "bilinear"):
         raise ValueError(
