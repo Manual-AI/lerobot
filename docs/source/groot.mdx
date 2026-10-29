@@ -222,6 +222,20 @@ uv run lerobot-rollout \
 > [!NOTE]
 > Value of `inference.queue_threshold` should not exceed 5 to ensure stable inference.
 
+#### RTC with relative actions
+
+Checkpoints fine-tuned with `--policy.use_relative_actions=true` predict actions as deltas
+against the observation they were predicted from, normalized with one statistics row per chunk
+step. RTC therefore cannot reuse the previous chunk's model-space output as the overlap prefix:
+those rows are anchored to the previous observation and to the previous chunk's step indices.
+Instead it takes the unexecuted tail in absolute coordinates, re-expresses it against the current
+observation (an SE(3) delta for end-effector groups, an elementwise offset for the rest), and
+normalizes each row with the statistics row of its new chunk step. No extra flags are needed —
+this happens automatically for relative-action checkpoints under `--inference.type=rtc` and on a
+policy server running RTC. With a non-invertible `action_decode_transform` (such as the LIBERO
+gripper transform) the absolute tail cannot be re-encoded, so chunks are predicted without
+overlap guidance and a warning is logged once.
+
 ## License
 
 GR00T N1.7 is released under the [NVIDIA Open Model License Agreement](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/).

@@ -42,6 +42,7 @@ from .pretrained import PreTrainedPolicy as PreTrainedPolicy
 from .rtc import (
     ActionQueue,
     QueueSnapshot,
+    RelativeRTCPrefixEncoder,
     RTCConfig,
     reanchor_relative_rtc_prefix,
     validate_trained_rtc_horizon,
@@ -97,6 +98,7 @@ __all__ = [
     "ActionQueue",
     "QueueSnapshot",
     "RTCConfig",
+    "RelativeRTCPrefixEncoder",
     "reanchor_relative_rtc_prefix",
     "validate_trained_rtc_horizon",
     # Utility functions

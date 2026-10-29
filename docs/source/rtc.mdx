@@ -129,7 +129,15 @@ RTCConfig(execution_horizon=10)
 - `ONES`: Full weight across entire execution_horizon
 - `ZEROS`: Binary (full weight up to inference_delay, then zero)
 
+**`prefix_guidance`**: Whether to condition each chunk on the previous chunk's unexecuted tail (default: `True`). In guided mode, setting it to `False` keeps asynchronous chunk production — and therefore latency hiding — but drops the overlap conditioning. Unlike disabling RTC, it keeps RTC's chunk replacement and full prediction horizon, so only the conditioning changes. Use it as an ablation to measure how much the prefix actually smooths chunk boundaries. Local RTC reads it from `--inference.rtc.prefix_guidance`, a policy server from `--execution.rtc.prefix_guidance`. Trained mode requires its hard prefix and rejects `prefix_guidance=False`.
+
 **`inference_delay`**: How many timesteps of inference latency your system has. This is passed to `predict_action_chunk()` rather than the config, since it may vary at runtime.
+
+## Relative-Action Policies
+
+Policies trained with relative actions predict deltas against the observation they were predicted from, so the previous chunk's model-space output cannot be reused verbatim as the prefix — it is anchored to the previous observation. Local RTC and the policy server therefore take the unexecuted tail in absolute coordinates and re-express it against the current observation before handing it to the policy.
+
+GR00T N1.7 checkpoints with native relative action groups go one step further: their statistics have one row per chunk step, and end-effector groups compose as SE(3) transforms rather than elementwise offsets, so the checkpoint's own processor encodes the prefix (`GrootN17PackInputsStep.encode_absolute_rtc_prefix`, found through the `RelativeRTCPrefixEncoder` protocol). This is automatic; no flags are involved. When the processor cannot build a prefix, for example behind a non-invertible action decode transform, that chunk is predicted without prefix guidance.
 
 ## Testing RTC Offline
 

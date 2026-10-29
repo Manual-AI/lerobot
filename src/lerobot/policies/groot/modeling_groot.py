@@ -372,18 +372,24 @@ class GrootPolicy(PreTrainedPolicy):
         *,
         inference_delay: int | None,
         prev_chunk_left_over: Tensor | None,
+        prev_chunk_left_over_reanchored: bool = False,
     ) -> tuple[dict[str, Tensor], dict[str, object] | None]:
         if prev_chunk_left_over is None:
             return inputs, None
-        if getattr(self.config, "use_relative_actions", False):
-            # Generic RTC only provides normalized leftovers from the previous chunk. For
-            # native relative-action N1.7 checkpoints those rows are tied to the old
-            # observation state and old per-horizon stats row, so using them as the next
-            # prefix can push the policy in the wrong direction. Run without native RTC
-            # overlap guidance until a GROOT-specific RTC path can pass re-anchored
-            # absolute leftovers through.
+        if getattr(self.config, "use_relative_actions", False) and not prev_chunk_left_over_reanchored:
+            # A relative-action prefix is only meaningful when it has been re-anchored to
+            # the observation this chunk is predicted from and normalized with the stats
+            # row of each leftover step's *new* horizon index. Model-space leftovers from
+            # the previous chunk are still tied to the previous observation and the
+            # previous stats rows, so using them as the prefix can push the policy in the
+            # wrong direction; run without native RTC overlap guidance instead. Chunk
+            # prediction re-anchors via `GrootN17PackInputsStep.encode_absolute_rtc_prefix`
+            # and sets `prev_chunk_left_over_reanchored`.
             if not getattr(self, "_warned_native_relative_rtc_prefix_disabled", False):
-                logger.info("Disabling native GR00T RTC prefix for relative-action policy")
+                logger.info(
+                    "Disabling native GR00T RTC prefix for relative-action policy: the caller did not "
+                    "provide a re-anchored prefix"
+                )
                 self._warned_native_relative_rtc_prefix_disabled = True
             return inputs, None
         if not isinstance(prev_chunk_left_over, torch.Tensor):
@@ -406,10 +412,13 @@ class GrootPolicy(PreTrainedPolicy):
         elif prev_actions.shape[0] != batch_size:
             raise ValueError("prev_chunk_left_over batch size must match the current GR00T N1.7 batch size.")
 
-        # The generic LeRobot RTC engine pads short leftovers with exact zero
-        # rows for fixed-shape policy calls. Native GR00T N1.7 RTC treats every
-        # provided prefix row as a real action constraint, so strip that padding
-        # before constructing the native overlap options.
+        # Fixed-shape callers may pad short leftovers with exact zero rows (the
+        # shared inference engine instead repeats the last row, a real hold
+        # target). Native GR00T N1.7 RTC treats every provided prefix row as a
+        # real action constraint, so strip trailing zero rows before constructing
+        # the native overlap options. An all-zero row that is a genuine action is
+        # indistinguishable from padding here and loses its guidance; it only
+        # ever shortens the overlap, never misdirects it.
         valid_prefix_rows = prev_actions.detach().abs().sum(dim=(0, 2)) > 0
         if valid_prefix_rows.any():
             valid_prefix_steps = int(valid_prefix_rows.nonzero()[-1].item()) + 1
@@ -498,6 +507,7 @@ class GrootPolicy(PreTrainedPolicy):
         batch: dict[str, Tensor],
         *,
         noise: Tensor | None = None,
+        prev_chunk_left_over_reanchored: bool = False,
         **kwargs: Unpack[RTCActionSelectKwargs],
     ) -> Tensor:
         """Predict a chunk of actions for inference by delegating to Isaac-GR00T.
@@ -506,6 +516,13 @@ class GrootPolicy(PreTrainedPolicy):
 
         For N1.7, LeRobot's RTC leftovers are converted into the native GR00T
         action-overlap options before calling the underlying model.
+
+        ``prev_chunk_left_over`` must already be in the policy's model action space.
+        Relative-action checkpoints additionally require it to be re-anchored to the
+        observation in ``batch`` (see
+        ``GrootN17PackInputsStep.encode_absolute_rtc_prefix``); pass
+        ``prev_chunk_left_over_reanchored=True`` to declare that, otherwise the prefix
+        is dropped and the chunk is predicted without overlap guidance.
 
         `noise` is the starting sample of the flow-matching loop, shaped as the underlying
         model's (B, action_horizon, max_action_dim). When it is None, fresh noise is drawn.
@@ -520,6 +537,7 @@ class GrootPolicy(PreTrainedPolicy):
             groot_inputs,
             inference_delay=kwargs.get("inference_delay"),
             prev_chunk_left_over=kwargs.get("prev_chunk_left_over"),
+            prev_chunk_left_over_reanchored=prev_chunk_left_over_reanchored,
         )
 
         # Get device from model parameters
