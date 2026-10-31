@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
 import math
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager, nullcontext
@@ -23,10 +24,10 @@ import torch
 from torch import Tensor, nn
 from torchvision.io import decode_image, encode_jpeg
 from torchvision.transforms import InterpolationMode, v2
-from torchvision.transforms.v2 import (
-    Transform,
-    functional as F,  # noqa: N812
-)
+from torchvision.transforms.functional import _interpolation_modes_from_int
+from torchvision.transforms.v2 import Transform
+
+logger = logging.getLogger(__name__)
 
 
 class JPEGCompression(Transform):
@@ -174,7 +175,8 @@ def _check_angle(value: float | Sequence[float], name: str) -> tuple[float, floa
 
 def _check_interpolation(interpolation: InterpolationMode | int | str) -> str:
     if isinstance(interpolation, int):
-        interpolation = F._utils._interpolation_modes_from_int(interpolation)  # noqa: SLF001
+        # A Pillow integer constant, converted the way torchvision.transforms.v2 converts it.
+        interpolation = _interpolation_modes_from_int(interpolation)
     mode = InterpolationMode(interpolation).value
     if mode not in ("nearest", "bilinear"):
         raise ValueError(
@@ -863,6 +865,11 @@ class BatchedGaussianNoise(BatchedTransform):
     Models readout noise from ADC quantization, which increases in low-light conditions and is common in
     real-robot setups where wrist cameras operate in suboptimal lighting.
 
+    This is the transform the config type `GaussianNoise` builds, and it is not the same transform as
+    `torchvision.transforms.v2.GaussianNoise`: each sample draws its own standard deviation from a range in
+    pixel-value scale, where torchvision's adds noise of one fixed `sigma` in the `[0, 1]` scale and takes
+    `mean`, `sigma` and `clip`. The config type `v2.GaussianNoise` builds torchvision's.
+
     Args:
         std (`float | Sequence[float]`, *optional*, defaults to `(5.0, 25.0)`):
             Range for the noise standard deviation in pixel-value scale (0-255), or a number `s` for `(0, s)`.
@@ -1351,9 +1358,10 @@ def _seeded_default_generators(seed: int, device: torch.device) -> Iterator[None
 class PerSampleTransform(BatchedTransform):
     """Run a per-sample transform on each sample of a batch in turn.
 
-    The adapter for transform types with no batched implementation: any `torchvision.transforms.v2` class
-    by name, and `JPEGCompression`. The wrapped transform draws its parameters from the default
-    generators, and the frames of one sample share them, as on the dataloader backend.
+    The adapter for transform types with no batched implementation: `JPEGCompression`, the `v2.Transform`
+    classes added with `register_image_transform`, and the `torchvision.transforms.v2` classes named by
+    type. The wrapped transform draws its parameters from the default generators, and the frames of one
+    sample share them, as on the dataloader backend.
 
     When the caller passes a generator (the gpu-backend training step), `make_params` draws one seed per
     sample from it, and `transform` seeds the default generators with that seed (under
@@ -1400,12 +1408,14 @@ class PerSampleTransform(BatchedTransform):
         return torch.stack(outputs)
 
 
-# LeRobot transforms with no batched implementation; `PerSampleTransform` wraps them.
+# Per-sample transforms with no batched implementation, LeRobot's own and the `v2.Transform` classes added
+# with `register_image_transform`; `PerSampleTransform` wraps them.
 _PER_SAMPLE_TRANSFORMS: dict[str, type[Transform]] = {
     "JPEGCompression": JPEGCompression,
 }
 
-# Batched counterparts, keyed by the same type names as `ImageTransformConfig.type`.
+# Batched transforms, LeRobot's own and those added with `register_image_transform`, keyed by the same type
+# names as `ImageTransformConfig.type`.
 _BATCHED_TRANSFORMS: dict[str, type[BatchedTransform]] = {
     "Identity": BatchedIdentity,
     "ColorJitter": BatchedColorJitter,
@@ -1421,6 +1431,148 @@ _BATCHED_TRANSFORMS: dict[str, type[BatchedTransform]] = {
     "PlanckianJitter": BatchedPlanckianJitter,
 }
 
+# The registered names that are also `torchvision.transforms.v2` classes because they are batched copies of
+# those classes: they take the same kwargs and the parity tests pin the same output, so resolving the bare
+# name to LeRobot's copy is not ambiguous. Every other registered name that torchvision also defines, such as
+# `GaussianNoise`, is a different transform under the same name, and building it warns once per process.
+_TORCHVISION_EQUIVALENTS = frozenset({"Identity", "ColorJitter", "RandomAffine", "RandomRotation"})
+
+# The config prefix that selects a `torchvision.transforms.v2` class even where a LeRobot type has its name.
+_V2_PREFIX = "v2."
+
+# What a config switching an ambiguous bare name to `v2.<Name>` has to change, appended to the warning.
+_V2_SWITCH_NOTES: dict[str, str] = {
+    "GaussianNoise": (
+        "torchvision.transforms.v2.GaussianNoise takes `mean`, `sigma` in [0, 1] and `clip` instead of `std` "
+        "in 0-255 pixel values. It accepts the uint8 frames training passes only from torchvision 0.24 on."
+    ),
+}
+
+# The ambiguous type names `make_batched_transform_from_config` has warned about in this process.
+_warned_ambiguous_types: set[str] = set()
+
+
+def _v2_transform_class(name: str) -> type[Transform] | None:
+    """The `torchvision.transforms.v2` transform class called `name`, or `None` if there is none."""
+    transform_cls = getattr(v2, name, None)
+    if isinstance(transform_cls, type) and issubclass(transform_cls, Transform):
+        return transform_cls
+    return None
+
+
+def _warn_if_ambiguous(name: str, cls: type) -> None:
+    """Log once per process that the bare `name` built LeRobot's `cls`, not torchvision's class."""
+    if (
+        name in _TORCHVISION_EQUIVALENTS
+        or name in _warned_ambiguous_types
+        or _v2_transform_class(name) is None
+    ):
+        return
+    _warned_ambiguous_types.add(name)
+    note = _V2_SWITCH_NOTES.get(name)
+    logger.warning(
+        "Image transform type '%s' builds LeRobot's %s, which is a different transform from "
+        "torchvision.transforms.v2.%s. To use torchvision's class instead, set the type to '%s%s' and pass "
+        "that class's kwargs.%s",
+        name,
+        cls.__name__,
+        name,
+        _V2_PREFIX,
+        name,
+        f" {note}" if note else "",
+    )
+
+
+def _qualified_name(cls: type) -> str:
+    """`cls` as `module.qualname`, which stays the same when its module is imported again."""
+    return f"{cls.__module__}.{cls.__qualname__}"
+
+
+def register_image_transform(name: str, cls: type[BatchedTransform] | type[Transform]) -> None:
+    """Make `name` usable as an `ImageTransformConfig.type`, building `cls` with the configured kwargs.
+
+    A `BatchedTransform` subclass is built as `cls(**kwargs)` and transforms the whole batch as float frames
+    in `[0, 1]`; `uint8` batches are converted for it and rounded back after. A
+    `torchvision.transforms.v2.Transform` subclass is built as `PerSampleTransform(cls(**kwargs))`, the way
+    `JPEGCompression` is, and is handed one sample's frames at a time: `uint8` frames as `uint8`, float frames
+    as `float32` in `[0, 1]`, on the device the frames are on (the accelerator, on the gpu backend).
+
+    The registry lives in the process, and type names persist in saved training configs, so:
+
+    - Call this before any transforms are built, in every process that builds them from a config: each
+      `lerobot-train` process (every accelerate rank, and again on `--resume`), the RL learner,
+      `lerobot-imgtransform-viz`, and any script that builds `ImageTransforms` or `BatchedImageTransforms`.
+      For `lerobot-train`, put the call in a package and pass
+      `--dataset.image_transforms.discover_packages_path=<package>`, which imports the package and its
+      modules in every process; the flag is not saved in the training config, so pass it again on `--resume`.
+    - Define `cls` at module level in an importable module, not in a notebook cell, so the built transforms
+      can be unpickled in spawned DataLoader workers.
+    - `name` cannot be a `torchvision.transforms.v2` class name, since the bare name would then stop meaning
+      torchvision's class in configs that already use it, and it cannot contain a `.`, which is reserved for
+      qualified spellings such as `v2.<Name>`. If a later torchvision release adds a class with a registered
+      name, registering it raises from then on, where LeRobot's own names that clash only warn.
+    - Registering a name again with the class it has does nothing, and with a class of the same `__module__`
+      and `__qualname__` (as importing or reloading the class's module again creates) points the name at the
+      new class, so this can run unconditionally at import time. Registering any other class under a taken
+      name raises.
+
+    Args:
+        name (`str`):
+            The type name configs refer to.
+        cls (`type[BatchedTransform] | type[torchvision.transforms.v2.Transform]`):
+            The transform class to build for `name`.
+
+    Raises:
+        TypeError: If `name` is not a `str`, or `cls` is neither a `BatchedTransform` nor a
+            `torchvision.transforms.v2.Transform` subclass.
+        ValueError: If `name` is empty, contains a `.`, is already registered to another class, or is a
+            `torchvision.transforms.v2` class name.
+
+    Example:
+        ```python
+        >>> from torchvision.transforms import v2
+        >>> from lerobot.transforms import ImageTransformConfig, register_image_transform
+        >>> class MaybeBlur(v2.RandomApply):
+        ...     def __init__(self, p: float = 0.5) -> None:
+        ...         super().__init__([v2.GaussianBlur(kernel_size=5)], p=p)
+        >>> register_image_transform("MaybeBlur", MaybeBlur)
+        >>> cfg = ImageTransformConfig(type="MaybeBlur", kwargs={"p": 0.3})
+        ```
+    """
+    if not isinstance(name, str):
+        raise TypeError(f"register_image_transform expects the name as a str, got {name!r}.")
+    if not (isinstance(cls, type) and issubclass(cls, (BatchedTransform, Transform))):
+        raise TypeError(
+            "register_image_transform expects a BatchedTransform or torchvision.transforms.v2.Transform "
+            f"subclass, got {cls!r}."
+        )
+    if not name or "." in name:
+        raise ValueError(
+            f"Image transform name {name!r} is not valid: it must be non-empty and contain no '.', which is "
+            f"reserved for qualified types such as '{_V2_PREFIX}<Name>'."
+        )
+    registered = _BATCHED_TRANSFORMS.get(name) or _PER_SAMPLE_TRANSFORMS.get(name)
+    if registered is cls:
+        return
+    if registered is None:
+        if _v2_transform_class(name) is not None:
+            raise ValueError(
+                f"Image transform type '{name}' is a torchvision.transforms.v2 class; register it under "
+                "another name."
+            )
+    elif _qualified_name(registered) != _qualified_name(cls):
+        raise ValueError(
+            f"Image transform type '{name}' is already registered to {_qualified_name(registered)}; register "
+            f"{_qualified_name(cls)} under another name."
+        )
+    # A class reloaded from the same module may have moved between the batched and per-sample kinds.
+    _BATCHED_TRANSFORMS.pop(name, None)
+    _PER_SAMPLE_TRANSFORMS.pop(name, None)
+    if issubclass(cls, BatchedTransform):
+        _BATCHED_TRANSFORMS[name] = cls
+    else:
+        _PER_SAMPLE_TRANSFORMS[name] = cls
+
 
 @dataclass
 class ImageTransformConfig:
@@ -1429,10 +1581,12 @@ class ImageTransformConfig:
       weight: This represents the multinomial probability (with no replacement)
             used for sampling the transform. If the sum of the weights is not 1,
             they will be normalized.
-      type: The name of the class used. This is either a class available under torchvision.transforms.v2 or a
-            custom transform defined here.
-      kwargs: Lower & upper bound respectively used for sampling the transform's parameter
-            (following uniform distribution) when it's applied.
+      type: The name of the transform: a LeRobot transform or one added with `register_image_transform`, any
+            `torchvision.transforms.v2` class, or `v2.<Name>` for the `torchvision.transforms.v2` class
+            `<Name>`. Where a LeRobot transform and a torchvision class share a name (`GaussianNoise`), the
+            bare name builds LeRobot's and `v2.<Name>` builds torchvision's.
+      kwargs: The keyword arguments the transform class is built with, such as the ranges its random
+            parameters are drawn from.
     """
 
     weight: float = 1.0
@@ -1443,10 +1597,11 @@ class ImageTransformConfig:
 @dataclass
 class ImageTransformsConfig:
     """
-    These transforms are all using standard torchvision.transforms.v2
-    You can find out how these transformations affect images here:
+    The image transforms to sample from: LeRobot transforms, ones added with `register_image_transform` and
+    `torchvision.transforms.v2` classes, named as `ImageTransformConfig.type` describes. You can find out how
+    the torchvision ones affect images here:
     https://pytorch.org/vision/0.18/auto_examples/transforms/plot_transforms_illustrations.html
-    `BatchedRandomSubsetApply` samples them per frame.
+    `BatchedRandomSubsetApply` draws a subset of them for each sample.
     """
 
     # Set this flag to `true` to enable transforms during training
@@ -1522,9 +1677,19 @@ class ImageTransformsConfig:
 def make_batched_transform_from_config(cfg: ImageTransformConfig) -> BatchedTransform:
     """Build the batched transform for a configured type.
 
-    Types with a batched implementation (`_BATCHED_TRANSFORMS`) get it. `JPEGCompression` and any other
-    `torchvision.transforms.v2` class are wrapped in `PerSampleTransform`, which applies them one sample at a
-    time.
+    A type `v2.<Name>` builds the `torchvision.transforms.v2` class `<Name>`, wrapped in `PerSampleTransform`,
+    and never a LeRobot transform. A bare name is looked up in this order:
+
+    1. LeRobot's batched transforms and the `BatchedTransform` classes added with `register_image_transform`,
+       built as they are.
+    2. `JPEGCompression` and the `v2.Transform` classes added with `register_image_transform`, wrapped in
+       `PerSampleTransform`, which applies them one sample at a time.
+    3. Any other `torchvision.transforms.v2` class, wrapped in `PerSampleTransform`.
+
+    LeRobot's `Identity`, `ColorJitter`, `RandomAffine` and `RandomRotation` are batched copies of the
+    torchvision classes of the same name, so for them the order does not change the result. A bare name that
+    LeRobot and torchvision use for different transforms (`GaussianNoise`) builds LeRobot's, and the first
+    build in a process logs a warning that points to `v2.<Name>`.
 
     Args:
         cfg (`ImageTransformConfig`):
@@ -1534,19 +1699,36 @@ def make_batched_transform_from_config(cfg: ImageTransformConfig) -> BatchedTran
         `BatchedTransform`: The batched transform.
 
     Raises:
-        ValueError: If the type is neither a LeRobot transform nor a `torchvision.transforms.v2` class.
+        ValueError: If the type is neither a registered transform nor a `torchvision.transforms.v2` class, or
+            is `v2.<Name>` where `<Name>` is not a `torchvision.transforms.v2` transform class.
     """
+    if cfg.type.startswith(_V2_PREFIX):
+        v2_name = cfg.type.removeprefix(_V2_PREFIX)
+        transform_cls = _v2_transform_class(v2_name)
+        if transform_cls is None:
+            raise ValueError(
+                f"Transform '{cfg.type}' is not valid: '{v2_name}' is not a transform class in "
+                "torchvision.transforms.v2."
+            )
+        return PerSampleTransform(transform_cls(**cfg.kwargs))
     if cfg.type in _BATCHED_TRANSFORMS:
-        return _BATCHED_TRANSFORMS[cfg.type](**cfg.kwargs)
+        batched_cls = _BATCHED_TRANSFORMS[cfg.type]
+        _warn_if_ambiguous(cfg.type, batched_cls)
+        return batched_cls(**cfg.kwargs)
     if cfg.type in _PER_SAMPLE_TRANSFORMS:
-        return PerSampleTransform(_PER_SAMPLE_TRANSFORMS[cfg.type](**cfg.kwargs))
-    transform_cls = getattr(v2, cfg.type, None)
-    if isinstance(transform_cls, type) and issubclass(transform_cls, Transform):
+        per_sample_cls = _PER_SAMPLE_TRANSFORMS[cfg.type]
+        _warn_if_ambiguous(cfg.type, per_sample_cls)
+        return PerSampleTransform(per_sample_cls(**cfg.kwargs))
+    transform_cls = _v2_transform_class(cfg.type)
+    if transform_cls is not None:
         return PerSampleTransform(transform_cls(**cfg.kwargs))
     valid = ", ".join(sorted({*_BATCHED_TRANSFORMS, *_PER_SAMPLE_TRANSFORMS}))
     raise ValueError(
-        f"Transform '{cfg.type}' is not valid. It must be a class in torchvision.transforms.v2 or one of: "
-        f"{valid}."
+        f"Transform '{cfg.type}' is not valid. It must be one of {valid}, a class in "
+        f"torchvision.transforms.v2, or '{_V2_PREFIX}<Name>' for the torchvision.transforms.v2 class <Name>. "
+        "A custom type must be registered with register_image_transform in this process before transforms "
+        "are built; with lerobot-train, pass --dataset.image_transforms.discover_packages_path=<package> "
+        "(again on --resume) to import the package that registers it."
     )
 
 
