@@ -249,7 +249,7 @@ dataset = LeRobotDataset(
 
 ### Available transform types
 
-The `type` of a transform can be any class from `torchvision.transforms.v2`, for example:
+The `type` of a transform can name one of LeRobot's own transforms:
 
 - **`ColorJitter`**: Adjusts brightness, contrast, saturation, and hue
 - **`SharpnessJitter`**: Randomly adjusts image sharpness
@@ -257,7 +257,19 @@ The `type` of a transform can be any class from `torchvision.transforms.v2`, for
 - **`GaussianNoise`**, **`MotionBlur`**, **`JPEGCompression`**, **`GaussianPatchBrightness`**, **`RandomShadow`**, **`CoarseDropout`**, **`GammaCorrection`**, **`PlanckianJitter`**: Camera and lighting effects seen on real robots
 - **`Identity`**: No transformation (useful for testing)
 
-Any other `torchvision.transforms.v2` class can be named as a `type` too (for example `RandomResizedCrop` or `GaussianBlur`); it is applied one sample at a time. You can also pass a torchvision transform directly to the `image_transforms` parameter.
+`ColorJitter`, `RandomAffine`, `RandomRotation` and `Identity` are batched copies of the `torchvision.transforms.v2` classes of the same name and take the same arguments. Written as `v2.ColorJitter`, `v2.RandomAffine`, `v2.RandomRotation` or `v2.Identity`, they build torchvision's class instead, which runs one sample at a time and so loses the batched speed-up on the `gpu` backend; prefer the bare names for these four.
+
+The `type` can also name any `torchvision.transforms.v2` class (for example `RandomResizedCrop` or `GaussianBlur`); it is applied one sample at a time. Write it as `v2.<Name>` (for example `v2.RandomResizedCrop`) to always get torchvision's class, even where LeRobot has a transform of the same name. You can also pass a torchvision transform directly to the `image_transforms` parameter.
+
+`GaussianNoise` is a name LeRobot and torchvision use for different transforms. `GaussianNoise` builds LeRobot's, which draws a noise standard deviation per sample from the range `std` in 0–255 pixel values; the first time it is built in a process, it logs a warning that points to `v2.GaussianNoise`. `v2.GaussianNoise` builds torchvision's, which adds noise with one fixed `sigma` in the `[0, 1]` scale and needs torchvision 0.24 or later, since training passes `uint8` frames and earlier releases reject them:
+
+```bash
+lerobot-train \
+  --dataset.repo_id=your-username/your-dataset \
+  --dataset.image_transforms.enable=true \
+  --dataset.image_transforms.tfs='{"sensor_noise":{"type":"GaussianNoise","kwargs":{"std":[5.0,25.0]}},"fixed_noise":{"type":"v2.GaussianNoise","kwargs":{"sigma":0.05}}}' \
+  --policy.type=act
+```
 
 Every transform is now batched, and the same batched transforms run on both backends. The per-sample classes (`SharpnessJitter`, `GaussianNoise`, `MotionBlur`, `GaussianPatchBrightness`, `RandomShadow`, `CoarseDropout`, `GammaCorrection`, `PlanckianJitter`, `RandomSubsetApply`) and `make_transform_from_config` remain importable as deprecated front ends over their `Batched*` replacements and warn on use; they will be removed in a future release. `ImageTransforms` is a plain `torch.nn.Module` taking a `(C, H, W)` or `(T, C, H, W)` tensor. Configurations naming a transform by `type` are unaffected.
 
@@ -266,6 +278,42 @@ Every transform is now batched, and the same batched transforms run on both back
 **Behaviour change for existing recipes.** Training reads frames as `uint8`, and the LeRobot transforms other than `ColorJitter`, `RandomAffine` and `RandomRotation` used to return non-float input unchanged. Recipes enabling `GaussianNoise`, `MotionBlur`, `GaussianPatchBrightness`, `RandomShadow`, `CoarseDropout`, `GammaCorrection` or `PlanckianJitter` were therefore training without them. They now apply on both backends, so such a recipe trains differently than it did before: it gets the augmentation it asked for. Transforms that were already applying are unchanged apart from rounding, since the batched path computes in float and rounds once at the end rather than after every transform.
 
 </Tip>
+
+### Custom transform types
+
+To name your own transform class in a configuration, register it with `register_image_transform`:
+
+```python
+from torchvision.transforms import v2
+
+from lerobot.transforms import ImageTransformConfig, register_image_transform
+
+
+class MaybeBlur(v2.RandomApply):
+    def __init__(self, p: float = 0.5):
+        super().__init__([v2.GaussianBlur(kernel_size=5)], p=p)
+
+
+register_image_transform("MaybeBlur", MaybeBlur)
+
+blur = ImageTransformConfig(type="MaybeBlur", kwargs={"p": 0.3})
+```
+
+A `BatchedTransform` subclass transforms the whole batch at once, as float frames in `[0, 1]`. A `torchvision.transforms.v2.Transform` subclass is applied one sample at a time, like `JPEGCompression`: `uint8` frames reach it as `uint8` and float frames as `float32`, on the device the frames are on, which is the accelerator on the `gpu` backend.
+
+The registry is per process, so register the type before any transforms are built in every process that builds them from a configuration: each `lerobot-train` process (every accelerate rank, and again on `--resume`), the RL learner, `lerobot-imgtransform-viz`, and any script of your own that builds `ImageTransforms` or `BatchedImageTransforms`. With `lerobot-train`, put the registration in a package (below, `my_transforms`, whose `__init__.py` holds the code above) and name it with `--dataset.image_transforms.discover_packages_path`, which imports the package and its modules in every process. The flag is not saved in the training config, so pass it again on `--resume`:
+
+```bash
+lerobot-train \
+  --dataset.repo_id=your-username/your-dataset \
+  --dataset.image_transforms.enable=true \
+  --dataset.image_transforms.discover_packages_path=my_transforms \
+  --dataset.image_transforms.tfs='{"blur":{"type":"MaybeBlur","kwargs":{"p":0.3}}}' \
+  --policy.type=act
+```
+
+- Define the class at module level in an importable module, not in a notebook cell: `lerobot-train` starts its DataLoader workers with `spawn` by default, and they import the class to unpickle the built transforms.
+- The name cannot be a `torchvision.transforms.v2` class name or contain a `.`. Registering a name again with the class it has does nothing, and with a class of the same module and qualified name, as reloading its module creates, points the name at that class. Registering any other class under a taken name raises an error.
 
 ### Configuration options
 
@@ -296,7 +344,7 @@ The randomization is unchanged: each sample draws its own transforms and paramet
 Things to know:
 
 - Requires an accelerator; `--policy.device=cpu` is refused. A dataset built by hand with its own `image_transforms` callable is refused too, since those run in the workers.
-- Supports every transform type the dataloader backend does. Types without a batched implementation (`JPEGCompression`, and torchvision classes other than `ColorJitter`, `RandomAffine`, `RandomRotation` and `Identity`) are applied one sample at a time inside the batch, so they do not get the speed-up; `JPEGCompression` also round-trips through the CPU. A transform that changes the frame size is refused on a batch of more than one sample.
+- Supports every transform type the dataloader backend does. Types without a batched implementation (`JPEGCompression`, registered `torchvision.transforms.v2.Transform` subclasses, torchvision classes other than `ColorJitter`, `RandomAffine`, `RandomRotation` and `Identity`, and every `v2.<Name>` type) are applied one sample at a time inside the batch, so they do not get the speed-up; `JPEGCompression` also round-trips through the CPU. A transform that changes the frame size is refused on a batch of more than one sample.
 - Reproducible from `--seed`, with each process seeded differently. Augmentation does not consume the policy's random stream, and `gpu_compile` and `gpu_chunk_size` do not change what is applied.
 - Both backends run the same batched transforms in float and round once at the end, so a sample augmented on one equals the same sample augmented on the other given the same parameters.
 - `gpu_compile` costs 15-30 s once per image shape. Peak memory is about two float copies of the batch images plus a few copies of one chunk; lower `gpu_chunk_size` if memory is tight. `random_order=true` multiplies the transform time by `max_num_transforms`.

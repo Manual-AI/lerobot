@@ -81,6 +81,26 @@ def test_rotation_rejects_expand():
         BatchedRandomRotation(degrees=5, expand=True)
 
 
+@pytest.mark.parametrize("type_name", ["RandomAffine", "RandomRotation"])
+def test_pillow_integer_interpolation_selects_the_mode(type_name):
+    # Like torchvision, a Pillow integer constant names the mode: 0 is nearest, 2 bilinear, 3 bicubic.
+    def build(interpolation):
+        cfg = ImageTransformConfig(type=type_name, kwargs={"degrees": 5, "interpolation": interpolation})
+        return make_batched_transform_from_config(cfg)
+
+    def mode(transform):
+        return getattr(transform, "affine", transform).interpolation
+
+    assert mode(build(0)) == "nearest"
+    assert mode(build(2)) == "bilinear"
+    with pytest.raises(ValueError, match="bicubic"):
+        build(3)
+    frames = torch.rand(2, 1, 3, 16, 16)
+    torch.testing.assert_close(
+        build(2)(frames, generator=_generator(0)), build("bilinear")(frames, generator=_generator(0))
+    )
+
+
 # --- Parity with torchvision, over the registry -----------------------------------------------
 #
 # For every type in `_BATCHED_TRANSFORMS` that mirrors a torchvision kernel, draw parameters for
@@ -171,6 +191,8 @@ def test_parity_cases_cover_the_registry():
     assert set(PARITY_EXPECTED) == set(PARITY_KWARGS)
     assert set(PARITY_EXPECTED) | LEROBOT_ONLY == set(tf._BATCHED_TRANSFORMS)  # noqa: SLF001
     assert not set(PARITY_EXPECTED) & LEROBOT_ONLY
+    # The bare names that build LeRobot's copy without a warning must each have a parity case.
+    assert set(PARITY_EXPECTED) >= tf._TORCHVISION_EQUIVALENTS  # noqa: SLF001
 
 
 @pytest.mark.parametrize("type_name", sorted(PARITY_EXPECTED))
