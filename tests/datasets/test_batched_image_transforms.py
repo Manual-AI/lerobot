@@ -555,3 +555,115 @@ def test_fallback_without_a_generator_leaves_the_global_generators_alone(monkeyp
     frames8 = torch.randint(0, 256, (3, 16, 16), dtype=torch.uint8, generator=_generator(0))
     out = ImageTransforms(_only("RandomSolarize", threshold=128, p=1.0))(frames8)
     torch.testing.assert_close(out, F.solarize(frames8, threshold=128))
+
+
+def _recording(seen: list[Tensor], inner: Callable[[Tensor], Tensor]) -> Callable[[Tensor], Tensor]:
+    """A per-sample transform that records each sample it is handed, then runs `inner` on it."""
+
+    def per_sample(sample: Tensor) -> Tensor:
+        seen.append(sample)
+        return inner(sample)
+
+    return per_sample
+
+
+def _uint8_frames(batch: int, low: int = 0) -> Tensor:
+    return torch.randint(
+        low, 256, (batch, FRAMES, 3, HEIGHT, WIDTH), dtype=torch.uint8, generator=_generator(0)
+    )
+
+
+def test_a_subset_takes_uint8_frames_when_every_transform_does():
+    solarize = PerSampleTransform(v2.RandomSolarize(threshold=128, p=1.0))
+    jitter = BatchedColorJitter(brightness=(0.5, 1.5))
+    assert BatchedRandomSubsetApply(
+        [solarize, PerSampleTransform(JPEGCompression(quality=(20, 90)))]
+    ).takes_uint8
+    assert not BatchedRandomSubsetApply([solarize, jitter]).takes_uint8
+    assert not BatchedRandomSubsetApply([solarize, BatchedRandomSubsetApply([jitter])]).takes_uint8
+
+
+@pytest.mark.parametrize("batch", [1, BATCH])
+def test_per_sample_transforms_alone_run_on_uint8_frames(monkeypatch, batch):
+    """On a batch of one and on the masked path alike, a chain of per-sample transforms never converts `uint8`
+    frames to float, so a full-resolution camera frame is never copied to float."""
+
+    def refuse(frames):
+        raise AssertionError("converted the frames between uint8 and float")
+
+    monkeypatch.setattr(tf, "_to_unit_float", refuse)
+    monkeypatch.setattr(tf, "_to_uint8", refuse)
+    seen = []
+    subset = BatchedRandomSubsetApply(
+        [
+            PerSampleTransform(_recording(seen, v2.RandomCrop((HEIGHT, WIDTH), padding=2))),
+            PerSampleTransform(v2.RandomSolarize(threshold=128, p=1.0)),
+        ]
+    )
+    frames8 = _uint8_frames(batch)
+    out = tf.apply_to_frames(subset, frames8, _generator(1))
+    assert len(seen) == batch and all(sample.dtype == torch.uint8 for sample in seen)
+    assert out.dtype == torch.uint8 and out.shape == frames8.shape
+
+
+def test_a_per_sample_transform_writing_in_place_reaches_neither_the_input_nor_other_samples():
+    """The masked path keeps the input frames for the samples that did not select a transform, so a wrapped
+    transform that writes in place is handed a copy of its sample."""
+    erase = PerSampleTransform(v2.RandomErasing(p=1.0, value=0, inplace=True))
+    subset = BatchedRandomSubsetApply(
+        [erase, PerSampleTransform(v2.RandomSolarize(threshold=128, p=1.0))], n_subset=1
+    )
+    frames8 = _uint8_frames(BATCH, low=1)
+    original = frames8.clone()
+    params = tf._tag_params(subset.make_params(frames8.shape, CPU, _generator(1)), True)
+    params["selected"] = torch.tensor([[1], [0], [1]])  # sample 1 erases, the others solarize
+    out = subset.transform(frames8, params)
+    assert torch.equal(frames8, original)
+    assert torch.equal(out[[0, 2]], F.solarize(original[[0, 2]], threshold=128))
+    assert (out[1] == 0).any()
+
+
+_RESIZE = ImageTransformConfig(type="Resize", kwargs={"size": (16, 20)})
+_CROP = ImageTransformConfig(type="RandomCrop", kwargs={"size": (HEIGHT, WIDTH), "padding": 2})
+_JITTER = ImageTransformConfig(type="ColorJitter", kwargs={"brightness": (0.5, 1.5), "hue": (-0.1, 0.1)})
+_SOLARIZE = ImageTransformConfig(type="RandomSolarize", kwargs={"threshold": 128, "p": 0.5})
+_JPEG = ImageTransformConfig(type="JPEGCompression", kwargs={"quality": (20, 90)})
+
+
+@pytest.mark.parametrize("random_order", [False, True])
+@pytest.mark.parametrize(
+    ("batch", "tfs", "n_subset", "chunk_size"),
+    [
+        (1, {"resize": _RESIZE, "solarize": _SOLARIZE, "jpeg": _JPEG}, 2, None),
+        (1, {"resize": _RESIZE, "jitter": _JITTER, "jpeg": _JPEG}, 2, None),
+        (BATCH, {"crop": _CROP, "solarize": _SOLARIZE, "jpeg": _JPEG}, 2, None),
+        (BATCH, {"solarize": _SOLARIZE, "jitter": _JITTER, "jpeg": _JPEG}, 2, None),
+        # The last chunk holds one sample, which runs only the transforms it selected.
+        (BATCH, {"crop": _CROP, "solarize": _SOLARIZE, "jpeg": _JPEG}, 1, 2),
+        (BATCH, {"solarize": _SOLARIZE, "jitter": _JITTER, "jpeg": _JPEG}, 1, 2),
+    ],
+)
+def test_uint8_frames_transform_as_through_a_float_copy(
+    monkeypatch, random_order, batch, tfs, n_subset, chunk_size
+):
+    """Handing `uint8` frames to per-sample transforms as they are changes no pixel: they survive the trip
+    through `[0, 1]` exactly, so the result equals the one computed from a float copy made up front."""
+    cfg = ImageTransformsConfig(enable=True, max_num_transforms=n_subset, random_order=random_order, tfs=tfs)
+    frames8 = _uint8_frames(batch)
+    out = BatchedImageTransforms(cfg, chunk_size=chunk_size)(frames8, _generator(1))
+    monkeypatch.setattr(PerSampleTransform, "takes_uint8", False)
+    assert torch.equal(out, BatchedImageTransforms(cfg, chunk_size=chunk_size)(frames8, _generator(1)))
+
+
+def test_nested_subsets_transform_uint8_frames_as_through_a_float_copy(monkeypatch):
+    def build() -> BatchedRandomSubsetApply:
+        solarize = PerSampleTransform(v2.RandomSolarize(threshold=128, p=1.0))
+        inner = BatchedRandomSubsetApply([BatchedColorJitter(brightness=(0.5, 1.5)), solarize])
+        return BatchedRandomSubsetApply(
+            [inner, PerSampleTransform(v2.RandomSolarize(threshold=64, p=1.0))], n_subset=1
+        )
+
+    frames8 = _uint8_frames(BATCH)
+    out = tf.apply_to_frames(build(), frames8, _generator(1))
+    monkeypatch.setattr(PerSampleTransform, "takes_uint8", False)
+    assert torch.equal(out, tf.apply_to_frames(build(), frames8, _generator(1)))

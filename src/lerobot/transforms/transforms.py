@@ -124,6 +124,9 @@ _PLANCKIAN_TEMPERATURE_STEP = 500
 # uint8 rounding torchvision applies between operations on uint8 input is not reproduced.
 # Transform types with no batched implementation (any `torchvision.transforms.v2` class by
 # name, and `JPEGCompression`) run through `PerSampleTransform`, which loops over the batch.
+# It also takes `uint8` frames as they are, so a chain of per-sample transforms alone runs on
+# `uint8` input with no float copy, which on a full-resolution camera frame costs more than a
+# resize to the policy's input size does. A chain with any batched transform converts up front.
 #
 # Randomness is confined to `make_params`, which draws from an explicit `torch.Generator`, and
 # `transform` is a pure function of the frames and those parameters. That is what lets the
@@ -476,9 +479,12 @@ def apply_to_frames(
 ) -> Tensor:
     """Apply a batched transform to `uint8` or floating point frames, returning the input's dtype.
 
-    The math runs on `float32` frames in `[0, 1]`. Some arguments are in the input's own pixel scale, as in
-    torchvision: `fill` of the affine transforms, and anything a wrapped per-sample transform takes. So every
-    parameter dict records whether the frames were `uint8`, and the transforms that need it read the flag.
+    The math runs on `float32` frames in `[0, 1]`. A transform with `takes_uint8` (a per-sample transform, or
+    a subset of per-sample transforms only) is handed `uint8` frames as they are; any other gets a float copy,
+    and its output is rounded back. Both give the same result, as `uint8` frames survive the trip through
+    `[0, 1]` exactly. Some arguments are in the input's own pixel scale, as in torchvision: `fill` of the
+    affine transforms, and anything a wrapped per-sample transform takes. So every parameter dict records
+    whether the frames were `uint8`, and the transforms that need it read the flag.
 
     Args:
         transform (`BatchedTransform`):
@@ -497,7 +503,7 @@ def apply_to_frames(
     """
     uint8_input = frames.dtype == torch.uint8
     if uint8_input:
-        work = frames.to(torch.float32) / 255.0
+        work = frames if transform.takes_uint8 else _to_unit_float(frames)
     elif frames.is_floating_point():
         work = frames.to(torch.float32)
     else:
@@ -516,8 +522,18 @@ def apply_to_frames(
             dim=0,
         )
     if uint8_input:
-        return (out * 255.0).round_().clamp_(0, 255).to(torch.uint8)
+        return out if transform.takes_uint8 else _to_uint8(out)
     return out.to(frames.dtype)
+
+
+def _to_unit_float(frames: Tensor) -> Tensor:
+    """`uint8` frames as `float32` in `[0, 1]`."""
+    return frames.to(torch.float32) / 255.0
+
+
+def _to_uint8(frames: Tensor) -> Tensor:
+    """Float frames in `[0, 1]` rounded to `uint8`."""
+    return (frames * 255.0).round_().clamp_(0, 255).to(torch.uint8)
 
 
 def _tag_params(params: Any, uint8_input: bool) -> Any:
@@ -566,8 +582,12 @@ class BatchedTransform(nn.Module):
     generator, and `transform`, which consumes them and holds all of the math. Every random draw lives in
     `make_params`, so `transform` can be compiled, or run one chunk of the batch at a time, without changing
     the augmentation. Inputs are float frames in `[0, 1]` of shape `(B, N, C, H, W)`, where the `N` frames of
-    a sample share its parameters.
+    a sample share its parameters; a subclass with `takes_uint8` also takes `uint8` frames in `[0, 255]`.
     """
+
+    # Whether `transform` also takes `uint8` frames in `[0, 255]`, and then returns them `uint8`.
+    # `apply_to_frames` hands such a transform `uint8` input as it is instead of a float copy.
+    takes_uint8: bool = False
 
     def make_params(
         self, shape: torch.Size, device: torch.device, generator: torch.Generator | None = None
@@ -1248,7 +1268,8 @@ class BatchedRandomSubsetApply(BatchedTransform):
     the samples that selected it, which keeps the work free of host-device synchronization at the cost of
     computing unselected samples too. On a batch of one (the dataloader backend, one sample per call in a
     DataLoader worker) only the selected transforms run, in sequence; that path also admits transforms
-    that change the frame size, which the masked path cannot hold.
+    that change the frame size, which the masked path cannot hold. When every transform takes `uint8`
+    frames, so does the subset, and they stay `uint8` throughout.
 
     Args:
         transforms (`Sequence[BatchedTransform]`):
@@ -1287,6 +1308,9 @@ class BatchedRandomSubsetApply(BatchedTransform):
             raise ValueError(f"n_subset should be in the interval [1, {len(transforms)}]")
         total = sum(p)
         self.transforms = nn.ModuleList(transforms)
+        # From the configuration alone, never from the drawn subset: the masked path's `torch.where` and the
+        # chunks of `apply_to_frames` combine outputs that must share a dtype whatever each sample selected.
+        self.takes_uint8 = all(transform.takes_uint8 for transform in transforms)
         self.register_buffer("p", torch.tensor([prob / total for prob in p]), persistent=False)
         self.n_subset = n_subset
         self.random_order = random_order
@@ -1380,6 +1404,8 @@ class PerSampleTransform(BatchedTransform):
             passed to `BatchedImageTransforms`: `uint8` in `[0, 255]` or floats in `[0, 1]`.
     """
 
+    takes_uint8 = True
+
     def __init__(self, transform: Callable[[Tensor], Tensor]) -> None:
         super().__init__()
         self.per_sample = transform
@@ -1395,16 +1421,21 @@ class PerSampleTransform(BatchedTransform):
     @torch.compiler.disable
     def transform(self, frames: Tensor, params: dict[str, Any]) -> Tensor:
         # The wrapped transform's own arguments (`fill`, a solarize threshold, ...) are in the pixel scale of
-        # the caller's input, so it is handed that input's dtype rather than the [0, 1] working copy.
-        uint8_input = params.get("uint8_input", False)
+        # the caller's input, so it is handed that input's dtype: `uint8` frames as they are, and the [0, 1]
+        # working copy of `uint8` input rounded back to `uint8` (and its output returned to [0, 1]).
+        rounded = params.get("uint8_input", False) and frames.is_floating_point()
         seeds = [None] * frames.shape[0] if params["seed"] is None else params["seed"].tolist()
         outputs = []
         for sample, seed in zip(frames.unbind(0), seeds, strict=True):
-            if uint8_input:
-                sample = (sample * 255.0).round_().clamp_(0, 255).to(torch.uint8)
+            if rounded:
+                sample = _to_uint8(sample)
+            elif sample.dtype == torch.uint8:
+                # A copy, as the rounding makes one: a transform that writes in place must not reach the
+                # caller's frames, nor, on the masked path, the frames kept for samples that did not select it.
+                sample = sample.clone()
             with nullcontext() if seed is None else _seeded_default_generators(seed, frames.device):
                 out = self.per_sample(sample)
-            outputs.append(out.to(frames.dtype) / 255.0 if uint8_input else out)
+            outputs.append(out.to(frames.dtype) / 255.0 if rounded else out)
         return torch.stack(outputs)
 
 
@@ -1796,7 +1827,7 @@ class BatchedImageTransforms(nn.Module):
         self._transform = torch.compile(self.transform) if compile_model else self.transform
 
     def transform(self, frames: Tensor, params: dict[str, Any]) -> Tensor:
-        """Transform float `(B, N, C, H, W)` frames with parameters drawn by `self.tf.make_params`."""
+        """Transform `(B, N, C, H, W)` frames with parameters drawn by `self.tf.make_params`."""
         return self.tf.transform(frames, params)
 
     def forward(self, images: Tensor, generator: torch.Generator | None = None) -> Tensor:
@@ -1812,7 +1843,8 @@ class BatchedImageTransforms(nn.Module):
 
         Returns:
             `torch.Tensor`: The transformed batch, same shape and dtype as the input. Floating point inputs
-            are computed in `float32`; `uint8` inputs are rounded back after the transform.
+            are computed in `float32`. `uint8` inputs stay `uint8` when every configured transform is a
+            per-sample one; otherwise they are computed in `float32` and rounded back after the transform.
         """
         if images.ndim not in (4, 5):
             raise ValueError(
