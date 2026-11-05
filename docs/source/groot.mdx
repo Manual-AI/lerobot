@@ -236,6 +236,58 @@ policy server running RTC. With a non-invertible `action_decode_transform` (such
 gripper transform) the absolute tail cannot be re-encoded, so chunks are predicted without
 overlap guidance and a warning is logged once.
 
+## Online fixed-factor action targets
+
+`dataset.online_action_resampling` opts into action-only time stretching for a single-observation,
+relative-EEF GR00T recipe with absolute fingers and `action_delta_offset=0`. The default `null`
+keeps the existing dataset path. Install the `scipy-dep` extra for SO(3) interpolation.
+The typed `OnlineActionResamplingConfig` lives in `lerobot.configs.online_action_resampling`
+and is also exported by `lerobot.datasets.online_action_resampling`.
+
+The config requires an immutable dataset `source_revision`, positive `source_fps`, `output_fps`
+and `stretch_factor` (identity default `1.0`), exact per-group `group_delays` in source frames,
+and explicit `source_contract` provenance. The contract records
+`reservoir="state_plus_recorded_action_tail_v1"`,
+`recorded_action_semantics="per_group_delay_compensated"`,
+`state_semantics="pre_delay_same_frame"`, `rotation_encoding="row_rot6d"`,
+`time_stretch_applied=false`, `idm_applied=false`, `calibration_sha256`,
+`pre_delay_source_revision`, and `delay_source_revision`. Additional provenance fields are
+included in the canonical identity. Supply verified lineage; processed stretches or missing
+pre-delay provenance are not valid inputs.
+
+Each loaded episode must satisfy exact state/action overlap at every group's recorded delay.
+The numeric reservoir combines the unshifted state channels and the retained action tail;
+no missing samples are reconstructed. Pose groups use names such as `right_ee_pose`, resolving
+`right_ee_pos_{x,y,z}.pos` and `right_ee_rot_{0..5}.pos` from feature metadata. Scalar groups use
+exact action feature names. Every action channel must be covered. The target builder resolves
+state channels by name; the GR00T training factory additionally requires the state/action
+prefix alignment and canonical XYZ/row-rot6d pose order used by its relative-action processor.
+
+For anchor `i`, output step `k`, delay `d` source frames and stretch `s`, the source query is
+`i + (k * source_fps / output_fps + d) / s`. Thus delay remains fixed in output robot time.
+Translation and fingers interpolate linearly, row-convention rot6d interpolates on SO(3), and
+integer queries preserve stored values exactly. Unsupported brackets clamp to the recorded
+endpoint and mark the whole action step as padding. Statistics exclude an entire chunk if
+any step is padded, matching the existing identity behavior.
+
+Images, current state and anchor sampling are unchanged. Scalar and batched reads, selected
+episodes, train/eval splits and both GR00T statistics paths use the same numeric builder.
+Streaming, feature renaming, nondefault storage and other policy combinations are rejected.
+`build_absolute_action_targets(...)` is the video-free array API;
+`dataset.get_online_action_sample(index, chunk_size=None)` returns `(action, state, is_pad)`
+without decoding images. Config `identity()` and `fingerprint()` include source provenance,
+selected episodes, timing, interpolation and statistics support rules for callers' cache and
+resume checks. Raw online GR00T initialization always computes target statistics from the selected
+training episodes, including absolute fingers, even if a checkpoint or caller supplies statistics.
+At `stretch_factor=1.0`, raw targets and padding exactly match the recorded compensated actions;
+final finger normalization can still differ from the disabled path, whose metadata statistics may
+cover a different episode population or include samples excluded by whole-chunk support.
+Saved processors persist a statistics identity covering the target fingerprint, native statistics horizon, valid action horizon and
+relative group geometry. Training accepts serialized processors only when that identity
+matches the dataset, including whether online resampling is enabled; for missing or mismatched identities, initialize from a raw N1.7 checkpoint to recompute.
+Inference without dataset metadata can load those processors directly. Train/eval metadata carries
+each resolved population while the saved dataset config retains the overall episode selection.
+
 ## License
 
 GR00T N1.7 is released under the [NVIDIA Open Model License Agreement](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/).
