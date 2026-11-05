@@ -630,13 +630,23 @@ def test_online_serialized_statistics_identity_guards_resume_and_allows_inferenc
     assert loaded_pack.online_action_statistics_identity == pack.online_action_statistics_identity
     assert loaded_pack.raw_stats == pack.raw_stats
     assert loaded_pack.training is True
+    policy._runtime_dataset_meta = ds.meta
+    inferred_pre, _ = make_groot_pre_post_processors_from_pretrained(policy, str(saved))
+    assert next(s for s in inferred_pre.steps if isinstance(s, GrootN17PackInputsStep)).training is True
+    del policy._runtime_dataset_meta
     # Disabling the feature still changes the target distribution; metadata-free
     # inference remains valid because it continues to use the saved representation.
     disabled_meta = load(dataset_root, episodes=[0, 1]).meta
     with pytest.raises(ValueError, match="identity.*raw N1.7 checkpoint"):
         make_groot_pre_post_processors_from_pretrained(policy, str(saved), dataset_meta=disabled_meta)
+    # Inferring disabled metadata must still enforce the saved online identity.
+    policy._runtime_dataset_meta = disabled_meta
+    with pytest.raises(ValueError, match="identity.*raw N1.7 checkpoint"):
+        make_groot_pre_post_processors_from_pretrained(policy, str(saved))
+    del policy._runtime_dataset_meta
     # Dataset-free inference is valid even for older serialized processors.
-    make_groot_pre_post_processors_from_pretrained(policy, str(saved))
+    inference_pre, _ = make_groot_pre_post_processors_from_pretrained(policy, str(saved))
+    assert next(s for s in inference_pre.steps if isinstance(s, GrootN17PackInputsStep)).training is False
     for change in (
         {"stretch_factor": 1.0},
         {"selected_episodes": [2]},
@@ -692,3 +702,36 @@ def test_online_processor_entrypoint_rejects_unsupported_geometry(dataset_root, 
         policy.use_relative_actions = False
     with pytest.raises(ValueError, match="online action resampling"):
         _online_action_statistics_identity(policy, meta)
+
+
+def test_disabled_serialized_resume_preserves_explicit_metadata_training_mode(dataset_root, tmp_path):
+    from lerobot.policies.groot.processor_groot import (
+        GrootN17PackInputsStep,
+        make_groot_pre_post_processors,
+        make_groot_pre_post_processors_from_pretrained,
+    )
+
+    disabled_meta = load(dataset_root).meta
+    policy = groot_config()
+    source = raw_checkpoint(tmp_path / "raw", baked_stats=False)
+    policy.base_model_path = str(source)
+    policy._runtime_dataset_meta = disabled_meta
+    fresh_pre, fresh_post = make_groot_pre_post_processors(policy)
+    assert next(s for s in fresh_pre.steps if isinstance(s, GrootN17PackInputsStep)).training is True
+    saved = tmp_path / "saved"
+    fresh_pre.save_pretrained(saved)
+    fresh_post.save_pretrained(saved)
+
+    # Ordinary serialized loading historically requires explicitly passed metadata
+    # to enable training mode, even when config carries runtime dataset metadata.
+    resumed_pre, _ = make_groot_pre_post_processors_from_pretrained(policy, str(saved))
+    resumed_pack = next(s for s in resumed_pre.steps if isinstance(s, GrootN17PackInputsStep))
+    assert resumed_pack.online_action_statistics_identity is None
+    assert resumed_pack.training is False
+    explicit_pre, _ = make_groot_pre_post_processors_from_pretrained(
+        policy, str(saved), dataset_meta=disabled_meta
+    )
+    assert next(s for s in explicit_pre.steps if isinstance(s, GrootN17PackInputsStep)).training is True
+    # Raw checkpoints keep their existing runtime metadata fallback.
+    raw_pre, _ = make_groot_pre_post_processors_from_pretrained(policy, str(source))
+    assert next(s for s in raw_pre.steps if isinstance(s, GrootN17PackInputsStep)).training is True
