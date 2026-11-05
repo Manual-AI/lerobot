@@ -17,6 +17,7 @@
 import logging
 from dataclasses import dataclass, field
 
+from lerobot.configs.online_action_resampling import OnlineActionResamplingConfig
 from lerobot.streaming.episode_pool import StreamingSamplingStrategy
 from lerobot.transforms import ImageTransformsConfig
 from lerobot.utils.import_utils import get_safe_default_video_backend
@@ -42,6 +43,7 @@ class DatasetConfig:
     # With streaming=true, an 'hf://buckets/OWNER/BUCKET' URI is also accepted and implies repo_type="bucket".
     root: str | None = None
     episodes: list[int] | None = None
+    online_action_resampling: OnlineActionResamplingConfig | None = None
     # Episode indices to drop (e.g. corrupt or heterogeneous ones). Applied on top of `episodes`.
     exclude_episodes: list[int] | None = None
     image_transforms: ImageTransformsConfig = field(default_factory=ImageTransformsConfig)
@@ -80,6 +82,10 @@ class DatasetConfig:
     eval_split: float = 0.0
 
     def __post_init__(self) -> None:
+        if self.online_action_resampling is not None:
+            self.online_action_resampling.validate()
+            if self.streaming:
+                raise ValueError("online action resampling does not support streaming")
         if self.repo_type not in ("dataset", "bucket"):
             raise ValueError(f"repo_type must be 'dataset' or 'bucket', got {self.repo_type!r}")
         if self.eval_split != 0.0 and self.streaming:

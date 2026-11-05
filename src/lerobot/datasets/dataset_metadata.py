@@ -29,6 +29,7 @@ from huggingface_hub import snapshot_download, sync_bucket
 from huggingface_hub.utils import WeakFileLock
 
 from lerobot.configs import DEPTH_METER_UNIT, VideoEncoderConfig, is_depth_map
+from lerobot.configs.online_action_resampling import OnlineActionResamplingConfig
 from lerobot.streaming.location import hf_bucket_uri
 from lerobot.utils.constants import DEFAULT_FEATURES, HF_LEROBOT_HOME, HF_LEROBOT_HUB_CACHE
 from lerobot.utils.feature_utils import _validate_feature_names
@@ -71,6 +72,11 @@ class LeRobotDatasetMetadata:
     ``episodes/`` parquet files that describe a dataset's structure, content,
     and statistics.
     """
+
+    # Runtime target semantics carried into video-free GR00T statistics. Saved
+    # training configs own persistence; source dataset metadata stays immutable.
+    online_action_resampling: OnlineActionResamplingConfig | None = None
+    online_action_resampling_identity: str | None = None
 
     def __init__(
         self,

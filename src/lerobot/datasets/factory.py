@@ -117,6 +117,24 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | StreamingLeRobotD
     Returns:
         LeRobotDataset | StreamingLeRobotDataset: a StreamingLeRobotDataset when `cfg.dataset.streaming` is set.
     """
+    online = cfg.dataset.online_action_resampling
+    if online is not None:
+        policy = cfg.trainable_config
+        if getattr(policy, "type", None) != "groot" or getattr(policy, "n_obs_steps", None) != 1:
+            raise ValueError("online action resampling supports only single-observation GR00T")
+        if getattr(policy, "action_delta_offset", 0) != 0 or not getattr(
+            policy, "use_relative_actions", False
+        ):
+            raise ValueError(
+                "online action resampling requires relative GR00T actions with action_delta_offset=0"
+            )
+        if not getattr(policy, "relative_eef_groups", None) or not getattr(
+            policy, "relative_exclude_joints", None
+        ):
+            raise ValueError("online action resampling requires EEF-relative poses and absolute fingers")
+        if cfg.dataset.streaming or cfg.rename_map:
+            raise ValueError("online action resampling does not support streaming or feature renaming")
+
     # On the "gpu" backend the workers only decode; lerobot-train augments each batch on the policy device.
     image_transforms_cfg = cfg.dataset.image_transforms
     image_transforms = (
@@ -140,6 +158,13 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | StreamingLeRobotD
             revision=cfg.dataset.revision,
             repo_type=repo_type,
         )
+        if online is not None:
+            from lerobot.policies.groot.configuration_groot import GrootConfig
+            from lerobot.policies.groot.processor_groot import _online_action_statistics_identity
+
+            # Validate the same geometry used to identify saved processor statistics.
+            ds_meta.online_action_resampling = online
+            _online_action_statistics_identity(cast(GrootConfig, policy), ds_meta)
         delta_timestamps = resolve_delta_timestamps(cfg.trainable_config, ds_meta, cfg.rename_map)
         episodes = resolve_episode_indices(
             cfg.dataset.episodes, ds_meta.total_episodes, cfg.dataset.exclude_episodes
@@ -170,6 +195,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | StreamingLeRobotD
                 tolerance_s=cfg.tolerance_s,
                 repo_type=repo_type,
                 video_decoder_cache_size=cfg.dataset.video_decoder_cache_size,
+                online_action_resampling=online,
             )
         else:
             dataset = StreamingLeRobotDataset(
@@ -220,6 +246,8 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | StreamingLeRobotD
             for stats_type, stats in IMAGENET_STATS.items():
                 dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
 
+    if online is not None:
+        cfg.dataset.online_action_resampling = dataset.online_action_resampling
     return dataset
 
 
@@ -285,6 +313,7 @@ def make_train_eval_datasets(
         tolerance_s=cfg.tolerance_s,
         repo_type=cfg.dataset.repo_type,
         video_decoder_cache_size=cfg.dataset.video_decoder_cache_size,
+        online_action_resampling=cfg.dataset.online_action_resampling,
     )
 
     eval_dataset = LeRobotDataset(
@@ -300,6 +329,7 @@ def make_train_eval_datasets(
         tolerance_s=cfg.tolerance_s,
         repo_type=cfg.dataset.repo_type,
         video_decoder_cache_size=cfg.dataset.video_decoder_cache_size,
+        online_action_resampling=cfg.dataset.online_action_resampling,
     )
 
     if cfg.dataset.use_imagenet_stats:
@@ -311,4 +341,6 @@ def make_train_eval_datasets(
                 for stats_type, stats in IMAGENET_STATS.items():
                     ds.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
 
+    # Each dataset's metadata carries its resolved subset for statistics. The saved
+    # config must retain the overall selection so the same split can be reloaded.
     return train_dataset, eval_dataset
