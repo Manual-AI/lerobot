@@ -498,6 +498,7 @@ def make_groot_pre_post_processors_from_pretrained(
 ]:
     """Load Groot processors for a raw N1.7 checkpoint or a serialized LeRobot pipeline."""
 
+    explicit_dataset_meta = dataset_meta is not None
     dataset_meta = dataset_meta or getattr(config, "_runtime_dataset_meta", None)
     expected_online_identity = _online_action_statistics_identity(config, dataset_meta)
 
@@ -547,7 +548,12 @@ def make_groot_pre_post_processors_from_pretrained(
             )
     _reconnect_groot_n1_7_pack_decode_steps(preprocessor, postprocessor)
     _apply_groot_action_decode_transform(preprocessor, postprocessor, config.action_decode_transform)
-    _set_groot_preprocessor_training(preprocessor, training=dataset_meta is not None)
+    # Runtime metadata is also needed to reject incompatible online statistics.
+    # Only online resumes opt into inferring training mode from it; ordinary
+    # serialized pipelines keep their existing explicit-metadata behavior.
+    _set_groot_preprocessor_training(
+        preprocessor, training=explicit_dataset_meta or expected_online_identity is not None
+    )
     return preprocessor, postprocessor
 
 
