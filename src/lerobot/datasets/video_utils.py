@@ -337,6 +337,13 @@ class VideoDecoderCache:
         decoder_factory: Optional callable taking an open binary file handle and
             returning a decoder. Defaults to torchcodec's ``VideoDecoder``
             (``seek_mode="approximate"``); when given, torchcodec is not required.
+            For ``decode_video_frames_torchcodec``, the decoder exposes
+            ``metadata.average_fps`` and ``get_frames_at(indices=...)`` returning
+            NCHW RGB ``data`` and CPU ``pts_seconds`` tensors. Pass the custom
+            cache through that function's ``decoder_cache`` argument; this hook
+            does not configure dataset readers automatically. Eviction closes
+            the file handle and releases the cached decoder reference; decoder
+            resources follow its existing object lifetime, without a close hook.
     """
 
     _SENTINEL: ClassVar[object] = object()
