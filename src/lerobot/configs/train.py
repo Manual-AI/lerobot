@@ -140,6 +140,8 @@ class TrainPipelineConfig(HubMixin):
     max_eval_samples: int = 0
     tolerance_s: float = 1e-4
     save_checkpoint: bool = True
+    # Export the actual fresh ACT model/processors at step zero, before consuming a batch.
+    save_initial_checkpoint: bool = False
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
     # A non-positive value disables periodic saving, keeping only the final checkpoint.
     save_freq: int = 20_000
@@ -250,6 +252,43 @@ class TrainPipelineConfig(HubMixin):
         # `pretrained_path` keeps naming the model the run started from (the model card's
         # `base_model`); the resumed weights and processors load from `checkpoint_path`.
 
+    def validate_initial_checkpoint(self) -> None:
+        """Reject unsupported initial-export modes without changing default training."""
+        if not self.save_initial_checkpoint:
+            return
+        p = self.policy
+        if (
+            self.resume
+            or self.reward_model is not None
+            or p is None
+            or p.type != "act"
+            or p.pretrained_path is not None
+            or p.pretrained_backbone_weights is not None
+            or self.peft is not None
+            or p.use_peft
+            or self.ema.enable
+            or not self.save_checkpoint
+            or self.save_checkpoint_to_hub
+            or p.push_to_hub
+            or type(self.seed) is not int
+            or any(type(v) is not int or v < 1 for v in (self.steps, self.batch_size, self.save_freq))
+            or self.checkpoint_format != CheckpointFormat.SAFETENSORS
+            or self.accelerator.mixed_precision != "no"
+            or self.accelerator.gradient_accumulation.steps != 1
+            or self.accelerator.compile.enabled
+            or self.accelerator.activation_checkpointing.mode != "none"
+            or self.parallelism.dp_replicate != 1
+            or self.parallelism.dp_shard != 1
+            or self.parallelism.cp_size != 1
+            or self.parallelism.cfg_parallel != 1
+            or int(os.environ.get("WORLD_SIZE", "1")) != 1
+        ):
+            raise ValueError(
+                "save_initial_checkpoint requires fresh single-process ACT, an explicit seed, "
+                "positive steps/batch/save_freq, local safetensors checkpoints, no pretrained weights, "
+                "PEFT, EMA, AMP, accumulation, compile or activation checkpointing"
+            )
+
     def validate(self) -> None:
         available_contexts = multiprocessing.get_all_start_methods()
         if (
@@ -263,6 +302,7 @@ class TrainPipelineConfig(HubMixin):
             )
 
         self._resolve_pretrained_from_cli()
+        self.validate_initial_checkpoint()
 
         if self.policy is None and self.reward_model is None:
             raise ValueError(

@@ -1,0 +1,78 @@
+# Export the actual initial ACT checkpoint
+
+`TrainPipelineConfig.save_initial_checkpoint` is opt-in and defaults to `false`.
+With `true`, the ordinary trainer exports its prepared live ACT model and saved
+processors to the existing step-zero checkpoint directory (normally
+`output_dir/checkpoints/000000`, padded further for step counts above six digits)
+before creating the training iterator
+or consuming the first batch. It then continues training those same objects. It
+does not reconstruct initialization from a seed, reload a second model, or add a
+training loop.
+
+Set these explicit configuration values for the supported fresh-run mode:
+
+```json
+{
+  "save_initial_checkpoint": true,
+  "save_checkpoint": true,
+  "save_checkpoint_to_hub": false,
+  "resume": false,
+  "seed": 0,
+  "checkpoint_format": "safetensors",
+  "ema": {"enable": false},
+  "peft": null,
+  "policy": {
+    "type": "act",
+    "pretrained_path": null,
+    "pretrained_backbone_weights": null,
+    "push_to_hub": false
+  }
+}
+```
+
+This is a configuration fragment, not a complete training command. Supply the
+actual dataset, architecture, output path, positive steps/batch/save frequency and
+an independently approved compute budget. Single-process CPU/CUDA, full precision,
+accumulation one, no compilation or activation checkpointing are supported.
+Unsupported modes fail instead of silently exporting a different kind of baseline.
+ACT defaults include pretrained backbone weights and Hub push; turn both off
+explicitly for this deliberately bounded from-scratch/local-only mode.
+The saved training config retains the opt-in flag. Resuming with it still true is
+rejected intentionally. A separate ordinary LeRobot resume would require explicitly
+setting save_initial_checkpoint=false; the native Gym wrapper continues to forbid
+resume entirely. Step-zero resume is untested and not supported by this
+qualification; no exact resumed-step-zero training equivalence is claimed.
+
+The helper delegates to the existing `save_checkpoint`, preserving the usual
+`pretrained_model/` and `training_state/` formats. The former contains model weights,
+policy/train configs and both saved processors; the latter includes step-zero
+optimizer/scheduler and RNG state. `initial_checkpoint.json` records completion,
+zero updates and SHA256 hashes of the exported files. It is not a policy-admission
+or task-evaluation manifest. Existing checkpoint directories, files and symlinks
+are refused, including partial exports from a failed attempt. No `last` link is
+updated by the initial export.
+
+Python, NumPy and Torch RNG state is restored on both success and failure; all
+already-initialized CUDA generator states are additionally restored. The standard
+training RNG file is rewritten from the entry state, so a serializer cannot move
+the saved initialization RNG forward. It uses the existing RNG file schema (CPU
+and current CUDA generator), not a new distributed resume format. No live tensor,
+processor or optimizer object is replaced. A serialization error propagates before
+training updates; retain partial files for diagnosis and choose a new run directory.
+
+For a native Gym wrapper, retain its existing development-only input admission,
+from-scratch and resume=false gates. Add an explicit requirement for
+save_initial_checkpoint=true when an exact-initial comparison is intended. The
+trainer enforces the supported initial-export modes; it does not enforce a dataset
+size, scenario allowlist, action/camera contract, train/validation lineage split,
+wall-clock budget or GPU ownership. Those remain wrapper/parent responsibilities.
+Do not weaken pretrained/resume guards to create a separate initialization model.
+
+Pin the changed trainer revision and qualify the exported checkpoint with the
+actual downstream loader before a training experiment. An older consumer of
+train_config.json must accept the new field.
+
+This public-fork implementation is independent of the decoder-factory and loader
+pin-memory hooks. It does not enable native/Gym data admission or change a deployed
+trainer/runtime pin. Qualify the complete trainer and downstream loader before
+using a new deployment.
