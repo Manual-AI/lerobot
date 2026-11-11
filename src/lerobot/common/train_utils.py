@@ -23,6 +23,8 @@ collectives. The leaf save/load helpers carry no rank gates of their own — the
 its writes live in the same method.
 """
 
+import hashlib
+import json
 import logging
 import os
 from importlib.resources import files
@@ -31,6 +33,7 @@ from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Any
 
 import httpx
+import torch
 import torch.distributed as dist
 from huggingface_hub import HfApi, ModelCard, ModelCardData, is_offline_mode, model_info, snapshot_download
 from huggingface_hub.errors import HFValidationError, OfflineModeIsEnabled
@@ -70,7 +73,7 @@ from lerobot.utils.constants import (
 )
 from lerobot.utils.hub import find_latest_hub_checkpoint
 from lerobot.utils.io_utils import load_json, write_json
-from lerobot.utils.random_utils import load_rng_state, save_rng_state
+from lerobot.utils.random_utils import get_rng_state, load_rng_state, save_rng_state, set_rng_state
 
 if TYPE_CHECKING:
     from accelerate import Accelerator
@@ -287,6 +290,88 @@ def save_checkpoint(
     )
     if accelerator is not None:
         accelerator.wait_for_everyone()
+
+
+def save_initial_checkpoint(
+    cfg: TrainPipelineConfig,
+    policy: PreTrainedPolicy,
+    optimizer: Optimizer,
+    scheduler: LRScheduler | None,
+    preprocessor: PolicyProcessorPipeline,
+    postprocessor: PolicyProcessorPipeline,
+    accelerator: "Accelerator",
+    step: int,
+) -> Path | None:
+    """Export the live step-zero objects once; failures propagate before any update.
+
+    An existing (including partial) destination is never reused. No model is
+    constructed/reloaded here. RNG is restored even if serialization fails.
+    """
+    if not cfg.save_initial_checkpoint:
+        return None
+    cfg.validate_initial_checkpoint()
+    if (
+        step != 0
+        or accelerator.num_processes != 1
+        or accelerator.distributed_type != "NO"
+        or accelerator.mixed_precision != "no"
+        or accelerator.gradient_accumulation_steps != 1
+        or accelerator.device.type not in ("cpu", "cuda")
+        or preprocessor is None
+        or postprocessor is None
+        or cfg.output_dir is None
+        or hasattr(accelerator.unwrap_model(policy), "_orig_mod")
+        or is_sharded_module(accelerator.unwrap_model(policy))
+    ):
+        raise ValueError("Initial checkpoint requires prepared single-process CPU/CUDA ACT at step zero")
+    checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, 0)
+    checkpoint_dir.mkdir(parents=True, exist_ok=False)
+    rng = get_rng_state()
+    cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_initialized() else None
+
+    def restore_rng() -> None:
+        set_rng_state(rng)
+        if cuda_rng is not None:
+            torch.cuda.set_rng_state_all(cuda_rng)
+
+    try:
+        save_checkpoint(
+            checkpoint_dir=checkpoint_dir,
+            step=0,
+            cfg=cfg,
+            policy=policy,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            accelerator=accelerator,
+        )
+        # Persist the entry RNG, even if a serializer consumed randomness.
+        restore_rng()
+        save_rng_state(checkpoint_dir / TRAINING_STATE_DIR)
+        file_hashes = {}
+        for path in sorted(checkpoint_dir.rglob("*")):
+            if path.is_file():
+                with path.open("rb") as stream:
+                    file_hashes[str(path.relative_to(checkpoint_dir))] = hashlib.file_digest(
+                        stream, "sha256"
+                    ).hexdigest()
+        with (checkpoint_dir / "initial_checkpoint.json").open("x") as stream:
+            json.dump(
+                {
+                    "schema_version": 1,
+                    "step": 0,
+                    "optimizer_updates": 0,
+                    "weights": "live_trainer_initialization",
+                    "files": file_hashes,
+                },
+                stream,
+                indent=2,
+            )
+            stream.write("\n")
+    finally:
+        restore_rng()
+    return checkpoint_dir
 
 
 def save_training_state(
