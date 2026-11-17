@@ -20,6 +20,7 @@ from lerobot.optim.schedulers import (
     CosineDecayWithWarmupSchedulerConfig,
     DiffuserSchedulerConfig,
     VQBeTSchedulerConfig,
+    WSDSchedulerConfig,
     load_scheduler_state,
     save_scheduler_state,
 )
@@ -106,3 +107,50 @@ def test_save_load_scheduler_state(scheduler, tmp_path):
     loaded_scheduler = load_scheduler_state(scheduler, tmp_path)
 
     assert scheduler.state_dict() == loaded_scheduler.state_dict()
+
+
+def _wsd_lrs(optimizer, steps, **kwargs):
+    scheduler = WSDSchedulerConfig(**kwargs).build(optimizer, num_training_steps=steps)
+    lrs = []
+    for _ in range(steps):
+        lrs.append(optimizer.param_groups[0]["lr"])
+        optimizer.step()
+        scheduler.step()
+    return lrs
+
+
+def test_wsd_scheduler_phases(optimizer):
+    peak = optimizer.param_groups[0]["lr"]
+    lrs = _wsd_lrs(optimizer, 100, num_warmup_steps=10, decay_fraction=0.2)
+    assert lrs[0] == 0.0 and lrs[10] == pytest.approx(peak)  # warmup reaches the peak
+    assert all(lr == pytest.approx(peak) for lr in lrs[10:80])  # stable phase
+    assert lrs[80] == pytest.approx(peak) and lrs[99] < peak * 0.1  # decay to ~0
+    assert all(a >= b for a, b in zip(lrs[80:], lrs[81:], strict=False))
+
+
+def test_wsd_scheduler_cosine_and_floor(optimizer):
+    peak = optimizer.param_groups[0]["lr"]
+    lrs = _wsd_lrs(
+        optimizer, 100, num_warmup_steps=0, decay_fraction=0.5, decay_type="cosine", final_lr_ratio=0.1
+    )
+    assert lrs[49] == pytest.approx(peak)
+    assert lrs[75] == pytest.approx(peak * 0.55, rel=0.05)  # halfway: floor + (1-floor)/2
+    assert min(lrs) >= peak * 0.1 - 1e-12
+
+
+def test_wsd_scheduler_explicit_decay_steps_and_scaling(optimizer):
+    peak = optimizer.param_groups[0]["lr"]
+    lrs = _wsd_lrs(optimizer, 50, num_warmup_steps=10, num_decay_steps=10)
+    assert lrs[39] == pytest.approx(peak) and lrs[49] < peak * 0.2
+    # warmup + decay longer than the run: scaled down, still warms up and decays
+    lrs = _wsd_lrs(optimizer, 20, num_warmup_steps=100, num_decay_steps=100)
+    assert max(lrs) == pytest.approx(peak)
+    assert lrs[-1] < max(lrs)
+
+
+def test_wsd_scheduler_registered_and_validated():
+    assert WSDSchedulerConfig().type == "wsd"
+    with pytest.raises(ValueError, match="decay_type"):
+        WSDSchedulerConfig(decay_type="exp")
+    with pytest.raises(ValueError, match="decay_fraction"):
+        WSDSchedulerConfig(decay_fraction=1.5)
