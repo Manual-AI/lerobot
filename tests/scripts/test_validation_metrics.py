@@ -15,12 +15,10 @@ def _cfg(eval_steps=None):
 
 
 def test_resolve_eval_steps():
-    assert resolve_eval_steps(_cfg(), 1000, 120) == 120  # one epoch
-    assert resolve_eval_steps(_cfg(), 10**6, 40_000) == 5000  # capped
-    assert resolve_eval_steps(_cfg(), 1000, None) == 5000  # no epoch length
-    assert resolve_eval_steps(_cfg(), 4, 1) == 0  # too few samples
-    assert resolve_eval_steps(_cfg(0), 1000, 120) == 0
-    assert resolve_eval_steps(_cfg(77), 1000, 120) == 77
+    assert resolve_eval_steps(_cfg(), 1000) == (0, True)  # at every checkpoint
+    assert resolve_eval_steps(_cfg(), 4) == (0, False)  # too few samples
+    assert resolve_eval_steps(_cfg(0), 1000) == (0, False)
+    assert resolve_eval_steps(_cfg(77), 1000) == (77, False)
 
 
 def test_action_error_ignores_padded_dims_and_padded_steps():
