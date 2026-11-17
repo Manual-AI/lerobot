@@ -106,6 +106,63 @@ class ConstantWithWarmupSchedulerConfig(LRSchedulerConfig):
         return LambdaLR(optimizer, lr_lambda, -1)
 
 
+@LRSchedulerConfig.register_subclass("wsd")
+@dataclass
+class WSDSchedulerConfig(LRSchedulerConfig):
+    """Warmup-Stable-Decay: linear warmup, a flat peak-LR phase, then a final decay phase.
+
+    The decay phase occupies the last ``num_decay_steps`` steps (or ``decay_fraction`` of the total
+    when that is None) and goes from the peak LR to ``final_lr_ratio * peak`` (linearly or with a
+    cosine). If warmup plus decay exceed the total number of steps, both are scaled down
+    proportionally so the schedule still completes.
+    """
+
+    num_warmup_steps: int = 1000
+    decay_fraction: float = 0.1
+    num_decay_steps: int | None = None
+    decay_type: str = "linear"
+    final_lr_ratio: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.decay_type not in ("linear", "cosine"):
+            raise ValueError(f"decay_type must be 'linear' or 'cosine', got {self.decay_type!r}")
+        if not 0.0 <= self.decay_fraction <= 1.0:
+            raise ValueError(f"decay_fraction must be in [0, 1], got {self.decay_fraction}")
+        if not 0.0 <= self.final_lr_ratio <= 1.0:
+            raise ValueError(f"final_lr_ratio must be in [0, 1], got {self.final_lr_ratio}")
+        if self.num_warmup_steps < 0 or (self.num_decay_steps is not None and self.num_decay_steps < 0):
+            raise ValueError("num_warmup_steps and num_decay_steps must be non-negative")
+
+    def build(self, optimizer: Optimizer, num_training_steps: int) -> LambdaLR:
+        warmup = self.num_warmup_steps
+        decay = (
+            self.num_decay_steps
+            if self.num_decay_steps is not None
+            else round(self.decay_fraction * num_training_steps)
+        )
+        if warmup + decay > num_training_steps:
+            scale = num_training_steps / (warmup + decay)
+            logging.info(
+                f"Auto-scaling WSD scheduler: warmup {warmup} + decay {decay} > "
+                f"num_training_steps ({num_training_steps}); scale factor {scale:.3f}"
+            )
+            warmup, decay = int(warmup * scale), int(decay * scale)
+        decay_start = num_training_steps - decay
+        floor = self.final_lr_ratio
+        cosine = self.decay_type == "cosine"
+
+        def lr_lambda(current_step: int) -> float:
+            if current_step < warmup:
+                return current_step / max(1, warmup)
+            if decay <= 0 or current_step < decay_start:
+                return 1.0
+            progress = min(1.0, (current_step - decay_start) / decay)
+            shape = 0.5 * (1.0 + math.cos(math.pi * progress)) if cosine else 1.0 - progress
+            return floor + (1.0 - floor) * shape
+
+        return LambdaLR(optimizer, lr_lambda, -1)
+
+
 @LRSchedulerConfig.register_subclass("cosine_annealing_with_warmup")
 @dataclass
 class CosineAnnealingWithWarmupSchedulerConfig(LRSchedulerConfig):
