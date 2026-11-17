@@ -15,12 +15,14 @@
 # limitations under the License.
 import logging
 import math
+import random
 from pprint import pformat
 from typing import Literal, cast
 
 import torch
 
 from lerobot.configs import PreTrainedConfig
+from lerobot.configs.default import ResolvedSplit
 from lerobot.configs.rewards import RewardModelConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.transforms import ImageTransforms
@@ -223,13 +225,37 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | StreamingLeRobotD
     return dataset
 
 
+def split_episodes_per_task(
+    task_to_episodes: dict[str, list[int]], eval_split: float, mode: str, seed: int
+) -> tuple[list[int], list[int]]:
+    """Split each task's episodes into (train, eval), stratified per task."""
+    rng = random.Random(seed)
+    train_episodes: list[int] = []
+    eval_episodes: list[int] = []
+    for eps in task_to_episodes.values():
+        # Always leave at least one training episode per task.
+        n_eval = min(math.ceil(len(eps) * eval_split), len(eps) - 1)
+        if n_eval <= 0:
+            train_episodes.extend(eps)
+        elif mode == "last":
+            train_episodes.extend(eps[: len(eps) - n_eval])
+            eval_episodes.extend(eps[len(eps) - n_eval :])
+        else:
+            held = set(rng.sample(range(len(eps)), n_eval))
+            train_episodes.extend(e for i, e in enumerate(eps) if i not in held)
+            eval_episodes.extend(e for i, e in enumerate(eps) if i in held)
+    return train_episodes, eval_episodes
+
+
 def make_train_eval_datasets(
     cfg: TrainPipelineConfig,
 ) -> tuple[LeRobotDataset | StreamingLeRobotDataset, LeRobotDataset | None]:
     """Create train and optional eval datasets by splitting episodes based on eval_split.
 
-    The last ceil(n_episodes * eval_split) episodes per task are held out for evaluation.
-    If eval_split == 0.0, returns (full_dataset, None).
+    ceil(n_episodes * eval_split) episodes per task are held out for validation, either the last
+    ones (`eval_split_mode="last"`) or a seeded random draw (`"random"`). Tasks with a single
+    episode stay entirely in train. If eval_split == 0.0, or no task can spare an episode, returns
+    (full_dataset, None). The resulting split is recorded in `cfg.dataset.resolved_split`.
     """
     full_dataset = make_dataset(cfg)
 
@@ -246,20 +272,46 @@ def make_train_eval_datasets(
         task_key = episode_tasks[ep_idx][0] if episode_tasks[ep_idx] else ""
         task_to_episodes.setdefault(task_key, []).append(ep_idx)
 
-    train_episodes, eval_episodes = [], []
-    for eps in task_to_episodes.values():
-        n_eval = math.ceil(len(eps) * cfg.dataset.eval_split)
-        train_episodes.extend(eps[: len(eps) - n_eval])
-        eval_episodes.extend(eps[len(eps) - n_eval :])
+    seed = cfg.seed if cfg.seed is not None else 0
+    train_episodes, eval_episodes = split_episodes_per_task(
+        task_to_episodes, cfg.dataset.eval_split, cfg.dataset.eval_split_mode, seed
+    )
 
-    if not train_episodes:
-        raise ValueError(
-            f"eval_split={cfg.dataset.eval_split} leaves 0 training episodes from {len(base_episodes)} total."
+    if not eval_episodes:
+        logger.warning(
+            f"eval_split={cfg.dataset.eval_split} holds out no episodes (every task has fewer than 2): "
+            "training on all data without validation."
         )
+        return full_dataset, None
+
+    resolved = ResolvedSplit(
+        mode=cfg.dataset.eval_split_mode,
+        eval_split=cfg.dataset.eval_split,
+        seed=seed,
+        train_episodes=train_episodes,
+        eval_episodes=eval_episodes,
+    )
+    saved = cfg.dataset.resolved_split
+    if (
+        cfg.resume
+        and saved is not None
+        and (saved.train_episodes != resolved.train_episodes or saved.eval_episodes != resolved.eval_episodes)
+    ):
+        changed = sorted(
+            (set(saved.eval_episodes) ^ set(resolved.eval_episodes))
+            | (set(saved.train_episodes) ^ set(resolved.train_episodes))
+        )
+        raise ValueError(
+            "The train/eval episode split differs from the one saved in the checkpoint's "
+            f"train_config.json (episodes that changed side or appeared/disappeared: {changed}). "
+            "Resuming would train on previously held-out episodes."
+        )
+    cfg.dataset.resolved_split = resolved
 
     logger.info(
-        f"Train/eval split: {len(train_episodes)} train, {len(eval_episodes)} eval "
-        f"(eval_split={cfg.dataset.eval_split}, {len(task_to_episodes)} tasks)"
+        f"Holding out {len(eval_episodes)} of {len(train_episodes) + len(eval_episodes)} episodes "
+        f"({cfg.dataset.eval_split:.0%}, mode={cfg.dataset.eval_split_mode}, {len(task_to_episodes)} tasks) "
+        "for validation; set --dataset.eval_split=0 to train on all data."
     )
 
     delta_timestamps = resolve_delta_timestamps(cfg.trainable_config, full_dataset.meta, cfg.rename_map)
