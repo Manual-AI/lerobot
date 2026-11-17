@@ -135,7 +135,7 @@ class TrainPipelineConfig(HubMixin):
     env_eval_freq: int = 20_000
     log_freq: int = 200  # 0 or negative disables periodic logging
     # Run the validation pass (eval_loss + eval_action_rmse) on held-out episodes every N steps.
-    # None = once per training epoch, capped at every 5000 steps; 0 = disabled. Requires eval_split > 0.
+    # None = at every checkpoint-saving step (`save_freq` and the final step); 0 = disabled. Requires eval_split > 0.
     eval_steps: int | None = None
     # Cap on total eval samples, split uniformly across tasks (0 = use all held-out data).
     max_eval_samples: int = 0

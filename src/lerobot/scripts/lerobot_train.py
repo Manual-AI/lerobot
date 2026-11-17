@@ -187,27 +187,24 @@ def _make_image_augmentation(
     )
 
 
-MAX_AUTO_EVAL_STEPS = 5000
 MIN_TRAIN_SAMPLES_FOR_EVAL = 5
 
 
-def resolve_eval_steps(cfg: TrainPipelineConfig, n_train_samples: int, epoch_steps: int | None) -> int:
-    """Number of training steps between validation passes (0 = validation disabled).
+def resolve_eval_steps(cfg: TrainPipelineConfig, n_train_samples: int) -> tuple[int, bool]:
+    """Validation cadence as `(eval_steps, eval_on_checkpoint)`.
 
-    An explicit `cfg.eval_steps` is used as given. With `None`, validation runs once per training
-    epoch (`epoch_steps`, or the cap if the epoch has no length), capped at `MAX_AUTO_EVAL_STEPS`,
-    and is disabled when there are fewer than `MIN_TRAIN_SAMPLES_FOR_EVAL` training samples.
+    An explicit `cfg.eval_steps` is used as given (0 = disabled). With `None`, validation runs at
+    every checkpoint-saving step, and is disabled when there are fewer than
+    `MIN_TRAIN_SAMPLES_FOR_EVAL` training samples.
     """
     if cfg.eval_steps is not None:
-        return cfg.eval_steps
+        return cfg.eval_steps, False
     if n_train_samples < MIN_TRAIN_SAMPLES_FOR_EVAL:
         logging.warning(
             f"Validation disabled: only {n_train_samples} training samples (< {MIN_TRAIN_SAMPLES_FOR_EVAL})."
         )
-        return 0
-    if epoch_steps is None or epoch_steps <= 0:
-        return MAX_AUTO_EVAL_STEPS
-    return min(epoch_steps, MAX_AUTO_EVAL_STEPS)
+        return 0, False
+    return 0, True
 
 
 def _action_error_terms(pred: torch.Tensor, batch: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
@@ -872,19 +869,16 @@ def train(cfg: TrainPipelineConfig) -> None:
             policy, optimizer, dataloader, lr_scheduler
         )
     finalize_sharded_policy(policy, parallel_dims)
-    eval_steps = 0
+    eval_steps, eval_on_checkpoint = 0, False
     compute_action_rmse = False
     if eval_dataloader is not None:
-        try:
-            epoch_steps = len(dataloader)
-        except TypeError:
-            epoch_steps = None
-        eval_steps = resolve_eval_steps(cfg, len(dataset), epoch_steps)
+        eval_steps, eval_on_checkpoint = resolve_eval_steps(cfg, len(dataset))
         # predict_action_chunk bypasses the FSDP2 forward hooks, so skip it for sharded runs;
         # reward models have no action output.
         compute_action_rmse = not parallel_dims.is_sharded and not cfg.is_reward_model_training
-        if is_main_process() and eval_steps > 0:
-            logging.info(f"Validation every {eval_steps} steps (eval_action_rmse={compute_action_rmse})")
+        if is_main_process() and (eval_steps > 0 or eval_on_checkpoint):
+            cadence = "at every checkpoint" if eval_on_checkpoint else f"every {eval_steps} steps"
+            logging.info(f"Validation {cadence} (eval_action_rmse={compute_action_rmse})")
     if cfg.resume:
         resume_after_prepare(cfg, accelerator, policy, optimizer, lr_scheduler)
 
@@ -1081,7 +1075,9 @@ def train(cfg: TrainPipelineConfig) -> None:
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0
         is_saving_step = should_save_checkpoint(step, cfg.save_freq, cfg.steps)
         is_env_eval_step = cfg.env_eval_freq > 0 and step % cfg.env_eval_freq == 0
-        is_eval_step = eval_steps > 0 and eval_dataloader is not None and step % eval_steps == 0
+        is_eval_step = eval_dataloader is not None and (
+            (eval_steps > 0 and step % eval_steps == 0) or (eval_on_checkpoint and is_saving_step)
+        )
 
         if is_log_step:
             # Collective reduce must run on every rank, before the main-process gate below.
