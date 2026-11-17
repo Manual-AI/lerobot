@@ -115,6 +115,9 @@ class WSDSchedulerConfig(LRSchedulerConfig):
     when that is None) and goes from the peak LR to ``final_lr_ratio * peak`` (linearly or with a
     cosine). If warmup plus decay exceed the total number of steps, both are scaled down
     proportionally so the schedule still completes.
+
+    Works with any policy: ``--scheduler.type=wsd`` replaces the policy's preset scheduler and keeps
+    its preset optimizer.
     """
 
     num_warmup_steps: int = 1000
