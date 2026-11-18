@@ -630,6 +630,12 @@ def make_dataloaders(
                 selected.extend(frames.tolist())
             eval_ds = torch.utils.data.Subset(eval_ds, selected)
 
+        if cfg.max_eval_batches > 0:
+            max_frames = cfg.max_eval_batches * cfg.batch_size
+            if len(eval_ds) > max_frames:
+                strided = torch.linspace(0, len(eval_ds) - 1, max_frames).long().tolist()
+                eval_ds = torch.utils.data.Subset(eval_ds, strided)
+
         eval_collate_fn = lerobot_collate_fn if dataset.meta.has_language_columns else None
         eval_dataloader = torch.utils.data.DataLoader(
             eval_ds,
@@ -1127,7 +1133,8 @@ def train(cfg: TrainPipelineConfig) -> None:
             if is_main_process():
                 logging.info(f"step {step}: " + " ".join(f"{k}={v:.4f}" for k, v in eval_metrics.items()))
                 if wandb_logger:
-                    wandb_logger.log_dict(eval_metrics, step=step, mode="eval")
+                    # `eval/steps` is the x-axis for the eval charts, like `train/steps` for training.
+                    wandb_logger.log_dict({**eval_metrics, "steps": step}, step=step, mode="eval")
 
         if cfg.save_checkpoint and is_saving_step:
             # Collective: every rank participates (gathers / DCP shard writes); rank-0-only file

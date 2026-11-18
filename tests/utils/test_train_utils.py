@@ -224,6 +224,7 @@ def test_dataloaders_filter_boundaries_without_consuming_policy_rng(
         persistent_workers=False,
         dataloader_multiprocessing_context=None,
         max_eval_samples=max_eval_samples,
+        max_eval_batches=0,
     )
     train, evaluation = make_dataloaders(cfg, Dataset(), Dataset(), 0, SimpleNamespace(device_type="cpu"))
     assert sorted(train.sampler) == expected
@@ -234,6 +235,45 @@ def test_dataloaders_filter_boundaries_without_consuming_policy_rng(
         expected[:max_eval_samples] if max_eval_samples else expected
     )
     assert torch.equal(rng, torch.get_rng_state())
+
+
+@pytest.mark.dataset
+@pytest.mark.skipif(not _datasets_available, reason="requires datasets")
+def test_max_eval_batches_strides_across_the_whole_held_out_split():
+    frames = 100
+
+    class Dataset(torch.utils.data.Dataset):
+        episodes = [0]
+        absolute_to_relative_idx = None
+        meta = SimpleNamespace(
+            episodes={"dataset_from_index": [0], "dataset_to_index": [frames]},
+            has_language_columns=False,
+        )
+
+        def __len__(self):
+            return frames
+
+        def __getitem__(self, index):
+            return index
+
+    cfg = SimpleNamespace(
+        trainable_config=SimpleNamespace(drop_n_first_frames=0, drop_n_last_frames=0),
+        dataset=SimpleNamespace(streaming=False),
+        resume=False,
+        seed=42,
+        num_workers=0,
+        batch_size=2,
+        prefetch_factor=None,
+        persistent_workers=False,
+        dataloader_multiprocessing_context=None,
+        max_eval_samples=0,
+        max_eval_batches=5,
+    )
+    _, evaluation = make_dataloaders(cfg, Dataset(), Dataset(), 0, SimpleNamespace(device_type="cpu"))
+    kept = torch.cat(list(evaluation)).tolist()
+    assert len(kept) == 10
+    assert kept[0] == 0 and kept[-1] == frames - 1
+    assert kept == sorted(kept)
 
 
 @pytest.mark.dataset
@@ -267,6 +307,7 @@ def test_streaming_dataloader_uses_num_workers_capped_by_rank_episodes(num_worke
         persistent_workers=False,
         dataloader_multiprocessing_context=None,
         max_eval_samples=0,
+        max_eval_batches=0,
     )
     parallel_dims = SimpleNamespace(device_type="cpu", dp_rank=0, dp_world_size=1)
     train, _ = make_dataloaders(cfg, Dataset(), None, 0, parallel_dims)
