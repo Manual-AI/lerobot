@@ -139,6 +139,9 @@ class TrainPipelineConfig(HubMixin):
     eval_steps: int | None = None
     # Cap on total eval samples, split uniformly across tasks (0 = use all held-out data).
     max_eval_samples: int = 0
+    # Cap on validation batches per pass (0 = all held-out data). The kept frames are evenly strided
+    # across the whole held-out split, so every held-out episode is represented.
+    max_eval_batches: int = 0
     tolerance_s: float = 1e-4
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
