@@ -30,3 +30,14 @@ def test_action_error_ignores_padded_dims_and_padded_steps():
     sq, n = _action_error_terms(pred, batch)
     assert n.item() == 3 * 4  # 3 valid steps x 4 dims
     assert math.sqrt(sq.item() / n.item()) == pytest.approx(2.0)
+
+
+def test_action_error_with_ground_truth_padded_wider_than_prediction():
+    """GR00T pads the preprocessed ground truth to max_action_dim and slices its prediction back."""
+    gt = torch.zeros(2, 3, 132)
+    gt[..., 17:] = 100.0  # padding, must not count
+    pred = torch.full((2, 3, 17), 2.0)
+    batch = {ACTION: gt, f"{ACTION}_is_pad": torch.zeros(2, 3, dtype=torch.bool)}
+    sq, n = _action_error_terms(pred, batch)
+    assert n.item() == 2 * 3 * 17
+    assert math.sqrt(sq.item() / n.item()) == pytest.approx(2.0)
