@@ -252,7 +252,16 @@ def run_validation(
     sq_sum = torch.zeros((), dtype=torch.float64, device=device)
     n_elems = torch.zeros((), dtype=torch.float64, device=device)
     with torch.no_grad(), accelerator.autocast():
-        for eval_batch in eval_dataloader:
+        # Nested under the training bar (position=1) and cleared when the pass ends.
+        eval_progbar = tqdm(
+            eval_dataloader,
+            desc="Validation",
+            unit="batch",
+            disable=inside_slurm() or not accelerator.is_main_process,
+            position=1,
+            leave=False,
+        )
+        for eval_batch in eval_progbar:
             eval_batch = _preprocess_dataset_batch(eval_batch, camera_keys, cfg.rename_map, preprocessor)
             loss, _ = policy(eval_batch)  # __call__, so FSDP2 forward hooks run
             loss_sum += loss.item()
