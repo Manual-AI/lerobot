@@ -210,7 +210,10 @@ def resolve_eval_steps(cfg: TrainPipelineConfig, n_train_samples: int) -> tuple[
 def _action_error_terms(pred: torch.Tensor, batch: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
     """Sum of squared errors and element count between a predicted chunk and the ground truth.
 
-    Only the real action dimensions (the ground-truth width) and the non-padded chunk steps count.
+    Only the real action dimensions and the non-padded chunk steps count. Policies pad one side to a
+    fixed width (GR00T pads the preprocessed ground truth to ``max_action_dim`` and slices its
+    prediction back to the real width; others pad the prediction), so the real width is the smaller
+    of the two.
     """
     gt = batch[ACTION]
     if gt.ndim == 2:
@@ -218,14 +221,15 @@ def _action_error_terms(pred: torch.Tensor, batch: dict[str, Any]) -> tuple[torc
     if pred.ndim == 2:
         pred = pred.unsqueeze(1)
     n_steps = min(gt.shape[1], pred.shape[1])
-    gt = gt[:, :n_steps].float()
-    pred = pred[:, :n_steps, : gt.shape[-1]].float()
+    action_dim = min(gt.shape[-1], pred.shape[-1])
+    gt = gt[:, :n_steps, :action_dim].float()
+    pred = pred[:, :n_steps, :action_dim].float()
     valid = torch.ones(gt.shape[:2], dtype=torch.bool, device=gt.device)
     is_pad = batch.get(f"{ACTION}_is_pad")
     if is_pad is not None:
         valid = ~is_pad[:, :n_steps].to(gt.device)
     sq = ((pred - gt) ** 2).sum(dim=-1)
-    count = valid.sum() * gt.shape[-1]
+    count = valid.sum() * action_dim
     return (sq * valid).sum().double(), count.double()
 
 
