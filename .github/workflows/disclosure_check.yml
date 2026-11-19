@@ -1,0 +1,58 @@
+# Copyright 2026 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Blocks pull requests whose title, body, commit messages or added lines contain terms from a
+# private denylist. The denylist lives in the DISCLOSURE_DENYLIST repository secret, not in the repo.
+name: Disclosure check
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  disclosure-check:
+    name: Disclosure check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Scan PR text, commit messages and added lines
+        env:
+          DISCLOSURE_DENYLIST: ${{ secrets.DISCLOSURE_DENYLIST }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+        run: |
+          if [ -z "$DISCLOSURE_DENYLIST" ]; then
+            if [ "$IS_FORK" = "true" ]; then
+              echo "::notice::Secrets are not available to fork PRs; a maintainer must review this PR's text manually."
+              exit 0
+            fi
+            echo "::error::The DISCLOSURE_DENYLIST repository secret is missing or empty."
+            exit 1
+          fi
+          printf '%s\n%s\n' "$PR_TITLE" "$PR_BODY" | python3 .github/scripts/disclosure_check.py --stdin --label "PR title/body"
+          python3 .github/scripts/disclosure_check.py --git-range "$BASE_SHA..$HEAD_SHA"
