@@ -32,6 +32,7 @@ from lerobot.utils.import_utils import get_safe_default_video_backend
 from .dataset_metadata import CODEBASE_VERSION, LeRobotDatasetMetadata
 from .dataset_reader import BaseDatasetReader, DatasetReader
 from .dataset_writer import DatasetWriter
+from .online_action_resampling import DatasetActionResampler, OnlineActionResamplingConfig
 from .storage import (
     DEFAULT_STORAGE_FORMAT,
     dataset_location,
@@ -75,6 +76,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         repo_type: str = "dataset",
         token: str | bool | None = None,
         video_decoder_cache_size: int | None = None,
+        online_action_resampling: OnlineActionResamplingConfig | None = None,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -229,6 +231,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
             to append to existing ones.
         """
         super().__init__()
+        self.online_action_resampling = online_action_resampling
+        self._action_resampler = None
         self.repo_id = repo_id
         if repo_type not in ("dataset", "bucket"):
             raise ValueError(f"repo_type must be 'dataset' or 'bucket', got {repo_type!r}")
@@ -294,6 +298,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.image_transforms = image_transforms
         self.reader: BaseDatasetReader | None
         self.writer: DatasetWriter | None
+        if online_action_resampling is not None and self.meta.storage_format != DEFAULT_STORAGE_FORMAT:
+            raise ValueError("online action resampling only supports parquet datasets")
         if self.meta.storage_format != DEFAULT_STORAGE_FORMAT:
             # non-default formats read the data in place at its root
             reader_kwargs: dict[str, Any] = {
@@ -341,6 +347,13 @@ class LeRobotDataset(torch.utils.data.Dataset):
                     self.revision = get_safe_version(self.repo_id, self.revision, token=token)
             self._download(download_videos, token=token)
             reader.load_and_activate()
+
+        self.writer = None
+        if online_action_resampling is not None:
+            self._action_resampler = DatasetActionResampler(self, online_action_resampling)
+            self.online_action_resampling = self._action_resampler.config
+            self.meta.online_action_resampling = self.online_action_resampling
+            self.meta.online_action_resampling_identity = self.online_action_resampling.fingerprint()
 
         # Detect write-mode params for backward compatibility
         _has_write_params = streaming_encoding or batch_encoding_size != 1
@@ -612,10 +625,20 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if isinstance(idx, slice):
             return [self[item_idx] for item_idx in range(*idx.indices(len(self)))]
 
-        return self._ensure_reader().get_item(idx)
+        item = self._ensure_reader().get_item(idx)
+        resampler = getattr(self, "_action_resampler", None)
+        return resampler.apply([item], [idx])[0] if resampler is not None else item
 
     def __getitems__(self, indices: list[int]) -> list[dict]:
-        return self._ensure_reader().get_items(list(indices))
+        items = self._ensure_reader().get_items(list(indices))
+        resampler = getattr(self, "_action_resampler", None)
+        return resampler.apply(items, list(indices)) if resampler is not None else items
+
+    def get_online_action_sample(self, idx: int, chunk_size: int | None = None):
+        """Return absolute action, unchanged current state, and padding without video decoding."""
+        if self._action_resampler is None:
+            raise ValueError("online action resampling is not enabled")
+        return self._action_resampler.sample(idx, chunk_size)
 
     def select_columns(self, column_names: str | list[str]):
         """Select specific columns from the underlying dataset.

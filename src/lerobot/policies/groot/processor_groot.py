@@ -19,7 +19,7 @@ import random
 from copy import copy, deepcopy
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypedDict
 
 import cv2
 import numpy as np
@@ -498,6 +498,10 @@ def make_groot_pre_post_processors_from_pretrained(
 ]:
     """Load Groot processors for a raw N1.7 checkpoint or a serialized LeRobot pipeline."""
 
+    explicit_dataset_meta = dataset_meta is not None
+    dataset_meta = dataset_meta or getattr(config, "_runtime_dataset_meta", None)
+    expected_online_identity = _online_action_statistics_identity(config, dataset_meta)
+
     # Drop the standard normalizer/unnormalizer override keys lerobot-train emits unconditionally:
     # GR00T has no such steps, so they would make both the raw-checkpoint and serialized override
     # paths raise. This must happen before either branch below.
@@ -531,9 +535,25 @@ def make_groot_pre_post_processors_from_pretrained(
         preprocessor_config_filename=preprocessor_config_filename,
         postprocessor_config_filename=postprocessor_config_filename,
     )
+    if dataset_meta is not None:
+        pack_step = next(
+            (step for step in preprocessor.steps if isinstance(step, GrootN17PackInputsStep)), None
+        )
+        saved_online_identity = pack_step.online_action_statistics_identity if pack_step is not None else None
+        if saved_online_identity != expected_online_identity:
+            raise ValueError(
+                "Serialized GR00T processors have missing or mismatched online action statistics identity. "
+                "Resume with the same online mode, source, selected training episodes, timing and relative geometry, "
+                "or start from a raw N1.7 checkpoint with dataset_meta to recompute target statistics."
+            )
     _reconnect_groot_n1_7_pack_decode_steps(preprocessor, postprocessor)
     _apply_groot_action_decode_transform(preprocessor, postprocessor, config.action_decode_transform)
-    _set_groot_preprocessor_training(preprocessor, training=dataset_meta is not None)
+    # Runtime metadata is also needed to reject incompatible online statistics.
+    # Only online resumes opt into inferring training mode from it; ordinary
+    # serialized pipelines keep their existing explicit-metadata behavior.
+    _set_groot_preprocessor_training(
+        preprocessor, training=explicit_dataset_meta or expected_online_identity is not None
+    )
     return preprocessor, postprocessor
 
 
@@ -590,6 +610,75 @@ def _resolve_feature_names_from_dataset_meta(dataset_meta: Any | None, feature_k
 
 def _resolve_action_feature_names_from_dataset_meta(dataset_meta: Any | None) -> list[str] | None:
     return _resolve_feature_names_from_dataset_meta(dataset_meta, ACTION)
+
+
+class _OnlineActionStatisticsGroup(TypedDict):
+    key: str
+    indices: list[int]
+    relative: bool
+    eef: bool
+
+
+class OnlineActionStatisticsIdentity(TypedDict):
+    version: str
+    target_fingerprint: str
+    action_names: list[str]
+    horizon: int
+    valid_action_horizon: int
+    action_delta_offset: int
+    groups: list[_OnlineActionStatisticsGroup]
+
+
+def _online_action_statistics_identity(
+    config: GrootConfig, dataset_meta: Any | None
+) -> OnlineActionStatisticsIdentity | None:
+    """Identify the exact online training population, window and representation."""
+    online = getattr(dataset_meta, "online_action_resampling", None)
+    if online is None:
+        return None
+    from lerobot.datasets.online_action_resampling import _resolve_groups
+
+    fingerprint = online.fingerprint()
+    if config.n_obs_steps != 1 or not config.use_relative_actions or config.action_delta_offset != 0:
+        raise ValueError(
+            "online action resampling requires relative GR00T actions with action_delta_offset=0"
+        )
+    names = _resolve_action_feature_names_from_dataset_meta(dataset_meta) or []
+    state_names = _resolve_feature_names_from_dataset_meta(dataset_meta, OBS_STATE) or []
+    if not names or state_names[: len(names)] != names:
+        raise ValueError("online action resampling requires aligned named state/action channels")
+    output_features = getattr(config, "output_features", None)
+    if output_features is not None and tuple(output_features[ACTION].shape) != (len(names),):
+        raise ValueError("online action resampling requires the full named action feature dimension")
+    groups = _infer_n1_7_action_groups(
+        names,
+        action_dim=len(names),
+        exclude_joints=list(config.relative_exclude_joints or []),
+        eef_groups=list(config.relative_eef_groups or []),
+    )
+    reservoir_groups = _resolve_groups(names, state_names, online)
+    canonical_poses = {tuple(ai) for _, _, ai, _, rotation in reservoir_groups if rotation}
+    if (
+        not canonical_poses
+        or {tuple(g.indices) for g in groups if g.eef} != canonical_poses
+        or any(g.relative and not g.eef for g in groups)
+    ):
+        raise ValueError(
+            "online action resampling requires canonical XYZ/row-rot6d relative EEF groups "
+            "and absolute non-EEF channels"
+        )
+    return OnlineActionStatisticsIdentity(
+        version="online-groot-relative-statistics-v1",
+        target_fingerprint=fingerprint,
+        action_names=names,
+        horizon=N1_7_NATIVE_ACTION_HORIZON,
+        valid_action_horizon=min(config.chunk_size, N1_7_NATIVE_ACTION_HORIZON),
+        action_delta_offset=0,
+        groups=[
+            _OnlineActionStatisticsGroup(key=g.key, indices=list(g.indices), relative=g.relative, eef=g.eef)
+            for g in groups
+        ],
+    )
 
 
 def _resolve_visual_modality_keys_from_dataset_meta(dataset_meta: Any | None) -> list[str] | None:
@@ -706,6 +795,11 @@ def _compute_horizon_relative_action_stats(
 
 
 def _iter_action_state_training_samples(dataset: Any):
+    if getattr(dataset, "online_action_resampling", None) is not None:
+        for idx in range(len(dataset)):
+            yield dataset.get_online_action_sample(idx)
+        return
+
     ensure_reader = getattr(dataset, "_ensure_reader", None)
     # Only the default parquet reader exposes hf_dataset; other readers
     # (e.g. lance) fall through to the generic per-item loop below.
@@ -864,6 +958,8 @@ def _make_relative_action_training_stats_from_dataset_meta(
         revision=getattr(dataset_meta, "revision", None),
         download_videos=False,
         return_uint8=True,
+        online_action_resampling=getattr(dataset_meta, "online_action_resampling", None),
+        episodes=getattr(getattr(dataset_meta, "online_action_resampling", None), "selected_episodes", None),
     )
     action_names = _resolve_action_feature_names_from_dataset_meta(dataset_meta)
     # Same grouping the pack step will use at training time, so the statistics and the conversion
@@ -1113,9 +1209,14 @@ def _build_n1_7_relative_action_processor_assets(
     state_stats = (meta_stats.get(OBS_STATE) if isinstance(meta_stats, dict) else None) or dataset_stats.get(
         OBS_STATE, {}
     )
+    # Online statistics already contain the absolute fingers from the resampled,
+    # selected, support-filtered targets. Source metadata describes different targets.
     absolute_action_stats = (
-        meta_stats.get(ACTION) if isinstance(meta_stats, dict) else None
-    ) or dataset_stats.get(ACTION, {})
+        dataset_stats.get(ACTION, {})
+        if getattr(dataset_meta, "online_action_resampling", None) is not None
+        else (meta_stats.get(ACTION) if isinstance(meta_stats, dict) else None)
+        or dataset_stats.get(ACTION, {})
+    )
     relative_action_stats = dataset_stats.get(ACTION, {})
     if not state_stats or not absolute_action_stats or not relative_action_stats:
         return None
@@ -1252,12 +1353,17 @@ def make_groot_pre_post_processors(
     """
 
     dataset_meta = dataset_meta or getattr(config, "_runtime_dataset_meta", None)
+    online_statistics_identity = _online_action_statistics_identity(config, dataset_meta)
     checkpoint_assets = _load_n1_7_checkpoint_processor_assets(config)
     checkpoint_stats = checkpoint_assets.stats if checkpoint_assets is not None else None
     checkpoint_has_stats = has_modality_stats(checkpoint_stats)
-    if config.use_relative_actions and not checkpoint_has_stats:
+    if config.use_relative_actions and (online_statistics_identity is not None or not checkpoint_has_stats):
         relative_dataset_stats = dataset_stats
-        if not _stats_preserve_action_horizon(relative_dataset_stats):
+        # Neither raw checkpoint statistics nor caller-supplied horizon stats prove
+        # they describe this online source/selection/warp. Always use the shared sampler.
+        if online_statistics_identity is not None or not _stats_preserve_action_horizon(
+            relative_dataset_stats
+        ):
             relative_dataset_stats = _make_relative_action_training_stats_from_dataset_meta(
                 config, dataset_meta
             )
@@ -1321,6 +1427,7 @@ def make_groot_pre_post_processors(
         use_percentiles=checkpoint_assets.use_percentiles if checkpoint_assets is not None else False,
         modality_config=checkpoint_assets.modality_config if checkpoint_assets is not None else None,
         action_decode_transform=config.action_decode_transform,
+        online_action_statistics_identity=online_statistics_identity,
     )
 
     # Resolve the image preprocessing geometry. Honor the checkpoint's processor_config
@@ -1682,6 +1789,7 @@ class GrootN17PackInputsStep(ProcessorStep):
     video_modality_keys: list[str] | None = None
     raw_stats: dict[str, Any] | None = None
     modality_config: dict[str, Any] | None = None
+    online_action_statistics_identity: OnlineActionStatisticsIdentity | None = None
     # Mirrors the postprocessor's decode transform so RTC prefix re-anchoring can refuse to
     # invert a non-invertible one. Re-applied from the policy config on every build and load by
     # `_apply_groot_action_decode_transform`, so it is deliberately not serialized.
@@ -2356,6 +2464,8 @@ class GrootN17PackInputsStep(ProcessorStep):
             "raw_stats": self.raw_stats,
             "modality_config": self.modality_config,
         }
+        if self.online_action_statistics_identity is not None:
+            config["online_action_statistics_identity"] = deepcopy(self.online_action_statistics_identity)
         if self.state_zero_indices:
             config["state_zero_indices"] = list(self.state_zero_indices)
         return config
