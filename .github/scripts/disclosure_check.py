@@ -21,7 +21,12 @@ import sys
 
 
 def load_patterns(path):
-    raw = open(path).read() if path else os.environ.get("DISCLOSURE_DENYLIST", "")
+    """Return (line number, compiled regex) pairs from a file or the DISCLOSURE_DENYLIST variable."""
+    if path:
+        with open(path) as f:
+            raw = f.read()
+    else:
+        raw = os.environ.get("DISCLOSURE_DENYLIST", "")
     return [
         (i, re.compile(line, re.IGNORECASE))
         for i, line in enumerate((ln.strip() for ln in raw.splitlines()), 1)
@@ -30,6 +35,7 @@ def load_patterns(path):
 
 
 def scan(text, label, patterns):
+    """Return one message per line of `text` that matches a pattern; never includes the matched text."""
     hits = []
     for lineno, line in enumerate(text.splitlines(), 1):
         for idx, pat in patterns:
@@ -39,10 +45,12 @@ def scan(text, label, patterns):
 
 
 def git(*args):
-    return subprocess.run(["git", *args], check=True, capture_output=True, text=True).stdout
+    """Run a git command and return its stdout."""
+    return subprocess.run(["git", *args], check=True, capture_output=True, text=True).stdout  # nosec B603 B607
 
 
 def main():
+    """Parse arguments, run the requested scans and return the exit status."""
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--denylist-file")
     ap.add_argument("--stdin", action="store_true")
