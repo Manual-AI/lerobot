@@ -1,0 +1,114 @@
+# Copyright 2026 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Detects denylisted terms outside the PR check: issue, comment, review and release text, and
+# pushed branches, tags and commits (including admin pushes that bypass PRs). This is detection,
+# not prevention: GitHub cannot block text before it is published. On a hit the workflow fails (so
+# you are notified), labels the issue or PR, and hides the offending comment. Deleting the comment
+# or its revision history is a manual follow-up. The denylist is the DISCLOSURE_DENYLIST secret.
+name: Disclosure check (events)
+
+on:
+  issues:
+    types: [opened, edited]
+  issue_comment:
+    types: [created, edited]
+  pull_request_review:
+    types: [submitted, edited]
+  pull_request_review_comment:
+    types: [created, edited]
+  release:
+    types: [published, edited]
+  push:
+    branches: ["**"]
+    tags: ["**"]
+
+permissions:
+  contents: read
+
+jobs:
+  scan-text:
+    name: Scan issue, comment, review and release text
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      # Always take the scanner from the default branch, never from the event's ref.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Scan the text
+        id: scan
+        env:
+          DISCLOSURE_DENYLIST: ${{ secrets.DISCLOSURE_DENYLIST }}
+          IS_FORK_PR: ${{ github.event.pull_request.head.repo.fork }}
+          TITLE: ${{ github.event.issue.title || github.event.release.name || github.event.release.tag_name }}
+          BODY: ${{ github.event.comment.body || github.event.review.body || github.event.issue.body || github.event.release.body }}
+        run: |
+          if [ -z "$DISCLOSURE_DENYLIST" ]; then
+            if [ "$IS_FORK_PR" = "true" ]; then
+              echo "::notice::Secrets are not available for events on fork PRs; review this text manually."
+              exit 0
+            fi
+            echo "::error::The DISCLOSURE_DENYLIST repository secret is missing or empty."
+            exit 1
+          fi
+          printf '%s\n%s\n' "$TITLE" "$BODY" | python3 .github/scripts/disclosure_check.py --stdin --label "${{ github.event_name }}" || echo "flagged=true" >> "$GITHUB_OUTPUT"
+
+      - name: Label and hide the flagged text
+        if: steps.scan.outputs.flagged == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          COMMENT_NODE_ID: ${{ github.event.comment.node_id }}
+        run: |
+          if [ -n "$NUMBER" ]; then
+            gh label create disclosure-flagged --color B60205 --description "Text matched the disclosure denylist; review and delete" --force
+            gh issue edit "$NUMBER" --add-label disclosure-flagged || true
+          fi
+          if [ -n "$COMMENT_NODE_ID" ]; then
+            gh api graphql -f id="$COMMENT_NODE_ID" -f query='mutation($id: ID!) { minimizeComment(input: {subjectId: $id, classifier: OFF_TOPIC}) { clientMutationId } }' || true
+          fi
+          echo "::error::Flagged text was hidden or labeled. Review it and delete the comment or its edit history if it is a real leak."
+          exit 1
+
+  scan-push:
+    name: Scan pushed refs and fork-only commits
+    if: github.event_name == 'push' && github.event.deleted == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Scan the ref name and commits not in upstream
+        env:
+          DISCLOSURE_DENYLIST: ${{ secrets.DISCLOSURE_DENYLIST }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ -z "$DISCLOSURE_DENYLIST" ]; then
+            echo "::error::The DISCLOSURE_DENYLIST repository secret is missing or empty."
+            exit 1
+          fi
+          git fetch --no-tags https://github.com/huggingface/lerobot.git main:refs/remotes/hf/main
+          printf '%s\n' "$REF_NAME" | python3 .github/scripts/disclosure_check.py --stdin --label "ref name"
+          python3 .github/scripts/disclosure_check.py --git-range hf/main..HEAD
