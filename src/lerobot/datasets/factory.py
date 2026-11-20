@@ -259,7 +259,9 @@ def make_train_eval_datasets(
     """
     full_dataset = make_dataset(cfg)
 
-    if cfg.dataset.eval_split == 0.0:
+    # DatasetConfig.__post_init__ resolves an unset eval_split to a float; None only exists in the type.
+    eval_split = cfg.dataset.eval_split
+    if not eval_split:
         return full_dataset, None
 
     base_episodes = (
@@ -274,19 +276,19 @@ def make_train_eval_datasets(
 
     seed = cfg.seed if cfg.seed is not None else 0
     train_episodes, eval_episodes = split_episodes_per_task(
-        task_to_episodes, cfg.dataset.eval_split, cfg.dataset.eval_split_mode, seed
+        task_to_episodes, eval_split, cfg.dataset.eval_split_mode, seed
     )
 
     if not eval_episodes:
         logger.warning(
-            f"eval_split={cfg.dataset.eval_split} holds out no episodes (every task has fewer than 2): "
+            f"eval_split={eval_split} holds out no episodes (every task has fewer than 2): "
             "training on all data without validation."
         )
         return full_dataset, None
 
     resolved = ResolvedSplit(
         mode=cfg.dataset.eval_split_mode,
-        eval_split=cfg.dataset.eval_split,
+        eval_split=eval_split,
         seed=seed,
         train_episodes=train_episodes,
         eval_episodes=eval_episodes,
@@ -310,7 +312,7 @@ def make_train_eval_datasets(
 
     logger.info(
         f"Holding out {len(eval_episodes)} of {len(train_episodes) + len(eval_episodes)} episodes "
-        f"({cfg.dataset.eval_split:.0%}, mode={cfg.dataset.eval_split_mode}, {len(task_to_episodes)} tasks) "
+        f"({eval_split:.0%}, mode={cfg.dataset.eval_split_mode}, {len(task_to_episodes)} tasks) "
         "for validation; set --dataset.eval_split=0 to train on all data."
     )
 
