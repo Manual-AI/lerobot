@@ -319,8 +319,12 @@ class TrainPipelineConfig(HubMixin):
         if not self.use_policy_training_preset and (self.optimizer is None or self.scheduler is None):
             raise ValueError("Optimizer and Scheduler must be set when the policy presets are not used.")
         elif self.use_policy_training_preset and not self.resume:
-            self.optimizer = active_cfg.get_optimizer_preset()
-            self.scheduler = active_cfg.get_scheduler_preset()
+            # The policy presets fill in whatever was not set explicitly, so a lone
+            # `--scheduler.type=wsd` swaps the scheduler and keeps the preset optimizer.
+            if self.optimizer is None:
+                self.optimizer = active_cfg.get_optimizer_preset()
+            if self.scheduler is None:
+                self.scheduler = active_cfg.get_scheduler_preset()
 
         image_transforms = self.dataset.image_transforms
         if image_transforms.enable and image_transforms.backend == "gpu" and active_cfg.device == "cpu":
