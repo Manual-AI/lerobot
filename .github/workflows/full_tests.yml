@@ -91,6 +91,9 @@ jobs:
       # lancedb-convert converts the fixtures for the lance backend tests
       - name: Install lerobot with all extras
         run: uv sync --locked --extra all --extra lancedb-convert # TODO(Steven): Make flash-attn optional
+        # egl-probe (via hf-libero -> robomimic) ships a CMakeLists that CMake 4 rejects; this lets it configure.
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
       - name: Login to Hugging Face
         if: env.HF_USER_TOKEN != ''
