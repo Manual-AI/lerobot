@@ -124,6 +124,8 @@ class TrainPipelineConfig(HubMixin):
     batch_size: int = 8
     prefetch_factor: int = 4
     persistent_workers: bool = True
+    # Override DataLoader pin_memory. None keeps the default (pin only on CUDA).
+    pin_memory: bool | None = None
     # DataLoader worker start method. "spawn" is safer than "fork" with
     # non-fork-safe libs (PyAV / torchcodec / ffmpeg), but adds some
     # worker-startup time per run since workers re-import modules instead
