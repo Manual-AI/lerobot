@@ -143,6 +143,41 @@ def test_trained_rtc_clamps_prefix_to_checkpoint_and_queue():
     assert estimate_delay(4 / 30, 1 / 30, ExecutionMode.RTC_TRAINED, 10, available=30) == 4
 
 
+def test_rtc_delay_estimate_recovers_from_one_slow_inference():
+    """A cold 2.7 s inference (82 steps at 30 fps) must not size every later prefix.
+
+    Steady inferences execute 10 actions each; once they fill the window, the estimate is 10,
+    leaving the rest of the overlap to blend.
+    """
+    from collections import deque
+
+    from lerobot.inference import ExecutionMode, estimate_delay
+    from lerobot.inference.execution import _DELAY_HISTORY_LEN
+
+    history = deque([82], maxlen=_DELAY_HISTORY_LEN)
+    estimates = []
+    for _ in range(_DELAY_HISTORY_LEN):
+        history.append(10)
+        # The 2.7 s turnaround is ignored once delays are counted.
+        estimates.append(estimate_delay(2.7, 1 / 30, ExecutionMode.RTC_GUIDED, 0, 50, history))
+
+    # Conservative until the slow sample ages out, then exactly the steady delay.
+    assert estimates[:-1] == [82] * (_DELAY_HISTORY_LEN - 1)
+    assert estimates[-1] == 10
+
+
+def test_trained_rtc_delay_estimate_keeps_a_step_of_margin():
+    """An under-estimate discards a trained chunk, so trained RTC conditions one step longer."""
+    from lerobot.inference import ExecutionMode, estimate_delay
+
+    recent = [5, 6, 4]
+    assert estimate_delay(0, 1 / 30, ExecutionMode.RTC_GUIDED, 10, 30, recent) == 6
+    assert estimate_delay(0, 1 / 30, ExecutionMode.RTC_TRAINED, 10, 30, recent) == 7
+    # Still bounded by the checkpoint and the leftover.
+    assert estimate_delay(0, 1 / 30, ExecutionMode.RTC_TRAINED, 6, 30, recent) == 6
+    assert estimate_delay(0, 1 / 30, ExecutionMode.RTC_TRAINED, 10, 3, recent) == 3
+
+
 @pytest.mark.parametrize(
     ("execution_horizon", "queue_threshold", "match"),
     [
@@ -653,6 +688,54 @@ def test_setup_defaults_to_starting_the_engine():
     assert strategy._engine is engine
     assert strategy._interpolator.multiplier == 2
     engine.start.assert_called_once()
+    engine.warmup.assert_called_once()
+
+
+def _warmup_ctx(engine, robot):
+    return SimpleNamespace(
+        runtime=SimpleNamespace(cfg=SimpleNamespace(interpolation_multiplier=1)),
+        policy=SimpleNamespace(inference=engine),
+        hardware=SimpleNamespace(robot_wrapper=robot),
+        processors=SimpleNamespace(robot_observation_processor=lambda obs: {**obs, "processed": True}),
+    )
+
+
+def _minimal_strategy():
+    from lerobot.rollout import BaseStrategyConfig, RolloutStrategy
+
+    class MinimalStrategy(RolloutStrategy):
+        def run(self, ctx):
+            pass
+
+        def teardown(self, ctx):
+            pass
+
+    return MinimalStrategy(BaseStrategyConfig())
+
+
+def test_setup_warms_the_engine_up_on_a_processed_live_observation():
+    engine = MagicMock()
+    observed = []
+    engine.warmup.side_effect = lambda observe: observed.append(observe())
+    robot = MagicMock()
+    robot.get_observation.return_value = {"m.pos": 1.0}
+
+    _minimal_strategy().setup(_warmup_ctx(engine, robot))
+
+    assert observed == [{"m.pos": 1.0, "processed": True}]
+    robot.send_action.assert_not_called()
+
+
+def test_setup_continues_when_the_warmup_fails(caplog):
+    engine = MagicMock()
+    engine.warmup.side_effect = RuntimeError("no GPU")
+
+    with caplog.at_level(logging.WARNING):
+        strategy = _minimal_strategy()
+        strategy.setup(_warmup_ctx(engine, MagicMock()))
+
+    assert strategy._engine is engine
+    assert "warm-up failed" in caplog.text
 
 
 # ---------------------------------------------------------------------------

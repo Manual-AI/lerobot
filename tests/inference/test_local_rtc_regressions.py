@@ -256,7 +256,11 @@ def test_transition_discards_observation_already_copied_by_worker(monkeypatch, t
 
 
 def test_trained_rtc_tolerates_one_overlap_miss_but_reports_persistent_delay():
-    engine = make_engine(rtc_config=RTCConfig(mode="trained", execution_horizon=4))
+    engine = make_engine(
+        policy=ControlledPolicy(steps=40),
+        rtc_config=RTCConfig(mode="trained", execution_horizon=4),
+        rtc_queue_threshold=40,
+    )
     now = [time.monotonic()]
     engine._runtime.clock = lambda: now[0]
     engine._robot.observation_time = now[0]
@@ -266,11 +270,12 @@ def test_trained_rtc_tolerates_one_overlap_miss_but_reports_persistent_delay():
         observe(engine)
         engine._policy.release.release()
         assert wait_for(lambda: len(engine._policy.calls) >= 2)
-        assert engine.action_queue.qsize() == 20
+        assert engine.action_queue.qsize() == 40
         for miss in range(5):
             assert engine._policy.calls[-1][1] == 4
-            now[0] += 0.2  # Six action intervals exceed the four-step checkpoint prefix.
-            engine._robot.observation_time = now[0]
+            # Five actions execute during the inference: one more than the checkpoint prefix.
+            for _ in range(5):
+                assert engine.get_action(None) is not None
             observe(engine)
             engine._policy.release.release()
             if miss < 4:

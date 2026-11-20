@@ -21,10 +21,11 @@ motor tick, including ticks without a queue pop. All clocks here are client-loca
 
 from __future__ import annotations
 
+import logging
 import math
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from threading import RLock
 from uuid import uuid4
@@ -34,6 +35,12 @@ import torch
 from lerobot.policies import ActionQueue, QueueSnapshot, RTCConfig
 
 from .contracts import ActionChunk, ActionProvenance, ExecutionMode, ObservationSnapshot
+
+logger = logging.getLogger(__name__)
+
+# Counted delays the next RTC prefix is sized from: the buffer ``Q`` (size ``b = 10``) of
+# Black et al., "Real-Time Execution of Action Chunking Flow Policies", Alg. 1.
+_DELAY_HISTORY_LEN = 10
 
 
 @dataclass(frozen=True)
@@ -116,9 +123,20 @@ class HoldState:
 
 
 def estimate_delay(
-    turnaround: float, interval: float, mode: ExecutionMode, training_max_delay: int, available: int
+    turnaround: float,
+    interval: float,
+    mode: ExecutionMode,
+    training_max_delay: int,
+    available: int,
+    recent_delays: Sequence[int] = (),
 ) -> int:
-    """Estimate overlap in action steps, bounded by real trained-prefix capacity.
+    """Estimate how many actions execute while the next chunk is computed.
+
+    Conservative, as in Black et al. (Alg. 1): the largest recently counted delay, so one
+    slow inference sizes the prefix for the next few chunks and then ages out. Trained RTC
+    adds a step of margin, because an under-estimate there discards the chunk, whereas
+    guided RTC only softens the first executed row. Until a delay is counted, the turnaround
+    stands in. Trained RTC is bounded by its real prefix capacity.
 
     Args:
         turnaround: Full request turnaround in seconds.
@@ -126,15 +144,19 @@ def estimate_delay(
         mode: Chunk, guided RTC, or trained RTC execution.
         training_max_delay: Maximum prefix steps supported by trained RTC.
         available: Number of unconsumed continuation steps.
+        recent_delays: Actions executed during recent inferences.
     """
-    delay = math.ceil(turnaround / interval) if turnaround else 0
+    if recent_delays:
+        delay = max(recent_delays) + (1 if mode is ExecutionMode.RTC_TRAINED else 0)
+    else:
+        delay = math.ceil(turnaround / interval) if turnaround else 0
     if mode is ExecutionMode.RTC_TRAINED:
         delay = min(delay or training_max_delay, training_max_delay, available)
     return delay if available else 0
 
 
 def trained_overlap_valid(conditioned: int, measured: int, maximum: int, has_previous: bool) -> bool:
-    """Require elapsed overlap to fit both the conditioning and training range."""
+    """Require the actions executed during inference to fit both the conditioning and training range."""
     return not has_previous or measured <= min(conditioned, maximum)
 
 
@@ -156,9 +178,13 @@ class ChunkRuntime:
         blend_steps: int = 0,
         blend_weight: float = 0.5,
         blend_indices: tuple[int, ...] = (),
+        rtc_horizon: int = 0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        """Allocate one action queue and a bounded steady-state latency window."""
+        """Allocate one action queue and bounded latency and executed-delay windows.
+
+        ``rtc_horizon`` is the guided RTC overlap the delay is checked against; zero skips it.
+        """
         for value in (action_interval, max_observation_age_s, action_timeout_s, startup_timeout_s):
             if not math.isfinite(value) or value <= 0:
                 raise ValueError("Execution intervals, ages and deadlines must be finite and positive")
@@ -197,6 +223,7 @@ class ChunkRuntime:
         self._starvation_request_deadline: float | None = None
         self._starvation_capture_after: float | None = None
         self.training_max_delay = training_max_delay
+        self.rtc_horizon = rtc_horizon
         self.clock = clock
         self.lock = RLock()
         self.queue = ActionQueue(RTCConfig(enabled=mode is not ExecutionMode.CHUNK))
@@ -210,6 +237,10 @@ class ChunkRuntime:
         self.started_at = clock()
         self.turnarounds: deque[float] = deque(maxlen=100)
         self._initial_turnaround = 0.0
+        # Actions executed while recent RTC chunks were computed; they size the next prefix.
+        # Kept across invalidation, since inference latency does not change between runs.
+        self.delays: deque[int] = deque(maxlen=_DELAY_HISTORY_LEN)
+        self._warned_no_blend = False
         self._completed = 0
         self._last_anchor: tuple[int, float, int] | None = None
         self.wait_events: deque[dict] = deque(maxlen=128)
@@ -219,6 +250,13 @@ class ChunkRuntime:
     def turnaround(self) -> float:
         """Largest complete action turnaround in the recent steady-state window."""
         return max(self.turnarounds, default=self._initial_turnaround)
+
+    def seed_delays(self, steps: int | None) -> None:
+        """Restart the executed-delay history from one estimate, or empty it with None."""
+        with self.lock:
+            self.delays.clear()
+            if steps is not None:
+                self.delays.append(steps)
 
     @property
     def effective_refill(self) -> float:
@@ -414,17 +452,42 @@ class ChunkRuntime:
                     observation.task_version,
                 )
             available = 0 if snapshot.model_actions is None else len(snapshot.model_actions)
+            delay = estimate_delay(
+                self.turnaround, self.interval, self.mode, self.training_max_delay, available, self.delays
+            )
+            self._warn_if_no_blend(delay, available)
             self.pending = ChunkRequest(
                 observation,
                 snapshot,
                 uuid4().hex,
                 self.generation,
                 self.mode,
-                estimate_delay(self.turnaround, self.interval, self.mode, self.training_max_delay, available),
+                delay,
                 self.clock(),
                 len(snapshot.provenance) * self.interval,
             )
             return self.pending
+
+    def _warn_if_no_blend(self, delay: int, available: int) -> None:
+        """Warn once when the expected delay covers the whole guided RTC overlap.
+
+        Guided RTC freezes (GR00T) or fully guides the first ``delay`` rows of the overlap and
+        ramps toward the new plan over the rest. Once the delay reaches the overlap, every
+        switch is a hard cut from the old plan to the new one.
+        """
+        overlap = min(self.rtc_horizon, available)
+        if self._warned_no_blend or self.mode is not ExecutionMode.RTC_GUIDED or not 0 < overlap <= delay:
+            return
+        self._warned_no_blend = True
+        logger.warning(
+            "RTC delay (%d steps) covers the whole overlap (%d steps: execution_horizon=%d, %d "
+            "leftover actions), so chunks switch with no blend. Raise the RTC execution_horizon "
+            "and the refill threshold above the delay, or shorten inference.",
+            delay,
+            overlap,
+            self.rtc_horizon,
+            available,
+        )
 
     def accept(self, request: ChunkRequest, chunk: ActionChunk, *, task_version: int) -> bool:
         """Validate context and timing, then atomically merge with original provenance."""
@@ -467,15 +530,19 @@ class ChunkRuntime:
             if self.mode is ExecutionMode.CHUNK:
                 actions = actions[: chunk.execution_steps]
                 model = model[: chunk.execution_steps]
+            # Actions committed while this chunk was computed: row ``progress`` of an RTC chunk is
+            # the next one to execute. Pops take this lock, so the check and the skip agree.
             progress = self.queue.snapshot().cursor - request.continuation.cursor
-            measured = math.ceil(elapsed / self.interval)
             available = request.continuation.model_actions
             has_previous = available is not None and len(available) > 0
+            rtc = self.mode is not ExecutionMode.CHUNK
             if self.mode is ExecutionMode.RTC_TRAINED and not trained_overlap_valid(
-                request.delay, max(measured, progress), self.training_max_delay, has_previous
+                request.delay, progress, self.training_max_delay, has_previous
             ):
+                # The queue is unchanged, so the retry conditions on what this one overlapped.
+                self.delays.append(progress)
                 return False
-            trim = min(measured, progress) if self.mode is not ExecutionMode.CHUNK else 0
+            trim = progress if rtc else 0
             if trim >= len(actions):
                 self.fault("Inference completed beyond its usable continuation horizon")
                 return False
@@ -499,11 +566,15 @@ class ChunkRuntime:
                 accepted = self.queue.merge(
                     model,
                     actions,
-                    measured,
+                    trim,
                     task=provenance.task,
                     provenance=provenance,
                     snapshot=request.continuation,
                 )
+            # A delay is only counted while the previous chunk executes: from an empty queue
+            # nothing is consumed, whatever the latency.
+            if accepted and rtc and has_previous:
+                self.delays.append(progress)
             self.last_accept["accepted"] = accepted
             if accepted and self.starvation_deadline is not None:
                 self.wait_events.append(

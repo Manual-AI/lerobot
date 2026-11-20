@@ -443,15 +443,17 @@ def test_groot_predict_action_chunk_forwards_n1_7_rtc_prefix(monkeypatch):
     )
 
     assert actions.shape == (1, 40, 7)
+    # The leftover is longer than the overlap: its head is what lines up with the new chunk's
+    # first rows, so only the first `execution_horizon` rows are handed over.
     assert dummy_model.get_action_options == {
-        "action_horizon": 8,
+        "action_horizon": 6,
         "rtc_overlap_steps": 6,
         "rtc_frozen_steps": 3,
         "rtc_ramp_rate": 6.0,
     }
-    assert dummy_model.forward_inputs["action"].shape == (1, 8, 132)
-    torch.testing.assert_close(dummy_model.forward_inputs["action"][0, :, :7], prev_chunk)
-    torch.testing.assert_close(dummy_model.forward_inputs["action"][0, :, 7:], torch.zeros(8, 125))
+    assert dummy_model.forward_inputs["action"].shape == (1, 6, 132)
+    torch.testing.assert_close(dummy_model.forward_inputs["action"][0, :, :7], prev_chunk[:6])
+    torch.testing.assert_close(dummy_model.forward_inputs["action"][0, :, 7:], torch.zeros(6, 125))
 
 
 def test_groot_predict_action_chunk_strips_padded_n1_7_rtc_prefix(monkeypatch):
@@ -2451,22 +2453,149 @@ def test_groot_n1_7_processor_uses_qwen_component_assets(monkeypatch):
             cls.from_pretrained_called = True
             raise AssertionError("Cosmos does not publish processor_config.json")
 
+    snapshot_calls = []
+
+    def fake_snapshot_download(repo_id, **kwargs):
+        snapshot_calls.append((repo_id, kwargs))
+        return "/hf-cache/models--nvidia--Cosmos-Reason2-2B/snapshots/abc"
+
     monkeypatch.setattr(processor_groot, "AutoTokenizer", FakeTokenizer)
     monkeypatch.setattr(processor_groot, "Qwen2VLImageProcessor", FakeImageProcessor)
     monkeypatch.setattr(processor_groot, "Qwen3VLVideoProcessor", FakeVideoProcessor)
     monkeypatch.setattr(processor_groot, "Qwen3VLProcessor", FakeProcessor)
+    monkeypatch.setattr(processor_groot, "snapshot_download", fake_snapshot_download)
 
     processor = processor_groot._build_n1_7_processor("nvidia/Cosmos-Reason2-2B")
 
+    # The cached snapshot is resolved without the network...
+    assert snapshot_calls == [("nvidia/Cosmos-Reason2-2B", {"local_files_only": True})]
+    # ...and every part loads from its directory: by repo id, AutoTokenizer would still ask the
+    # Hub for model_info even with local_files_only=True.
+    snapshot = "/hf-cache/models--nvidia--Cosmos-Reason2-2B/snapshots/abc"
     assert [call[:2] for call in calls] == [
-        ("tokenizer", "nvidia/Cosmos-Reason2-2B"),
-        ("image_processor", "nvidia/Cosmos-Reason2-2B"),
-        ("video_processor", "nvidia/Cosmos-Reason2-2B"),
+        ("tokenizer", snapshot),
+        ("image_processor", snapshot),
+        ("video_processor", snapshot),
     ]
-    assert all(call[2] == {"trust_remote_code": True} for call in calls)
+    assert all(call[2] == {"trust_remote_code": True, "local_files_only": True} for call in calls)
     assert processor.tokenizer.padding_side == "left"
     assert processor.chat_template == "fake-chat-template"
     assert not FakeProcessor.from_pretrained_called
+
+
+@pytest.mark.parametrize("cache", ["not_cached", "cached_without_the_video_processor"])
+def test_groot_n1_7_processor_falls_back_to_the_hub_when_not_cached(monkeypatch, cache):
+    pytest.importorskip("transformers")
+
+    from huggingface_hub.errors import LocalEntryNotFoundError
+
+    from lerobot.policies.groot import processor_groot
+
+    calls = []
+
+    def fake_component(name):
+        class FakeComponent:
+            chat_template = "fake-chat-template"
+            padding_side = "right"
+
+            @classmethod
+            def from_pretrained(cls, model_name, **kwargs):
+                calls.append((name, model_name, kwargs.get("local_files_only", False)))
+                if kwargs.get("local_files_only") and name == "video_processor":
+                    raise OSError("not in the local cache")
+                return cls()
+
+        return FakeComponent
+
+    def fake_snapshot_download(repo_id, **kwargs):
+        if cache == "not_cached":
+            raise LocalEntryNotFoundError("not in the local cache")
+        return "/hf-cache/snapshot"
+
+    class FakeProcessor:
+        def __init__(self, *, image_processor, tokenizer, video_processor, chat_template):
+            self.tokenizer = tokenizer
+
+    monkeypatch.setattr(processor_groot, "AutoTokenizer", fake_component("tokenizer"))
+    monkeypatch.setattr(processor_groot, "Qwen2VLImageProcessor", fake_component("image_processor"))
+    monkeypatch.setattr(processor_groot, "Qwen3VLVideoProcessor", fake_component("video_processor"))
+    monkeypatch.setattr(processor_groot, "Qwen3VLProcessor", FakeProcessor)
+    monkeypatch.setattr(processor_groot, "snapshot_download", fake_snapshot_download)
+
+    processor_groot._build_n1_7_processor("nvidia/Cosmos-Reason2-2B")
+
+    online = [
+        ("tokenizer", "nvidia/Cosmos-Reason2-2B", False),
+        ("image_processor", "nvidia/Cosmos-Reason2-2B", False),
+        ("video_processor", "nvidia/Cosmos-Reason2-2B", False),
+    ]
+    if cache == "not_cached":
+        assert calls == online
+    else:
+        # One part missing from the snapshot reloads all three online, so they stay consistent.
+        assert calls == [
+            ("tokenizer", "/hf-cache/snapshot", True),
+            ("image_processor", "/hf-cache/snapshot", True),
+            ("video_processor", "/hf-cache/snapshot", True),
+            *online,
+        ]
+
+
+def test_groot_n1_7_processor_builds_from_the_cache_without_any_network(monkeypatch):
+    """With the backbone cached, building the processor opens no connection at all.
+
+    Unmocked transformers and huggingface_hub, with every socket connect refused: the case a
+    monkeypatched unit test cannot catch, since AutoTokenizer's Hub call ignores
+    local_files_only. Runs only where the backbone's processor files are already cached.
+    """
+    pytest.importorskip("transformers")
+    import socket
+
+    from huggingface_hub import snapshot_download
+
+    from lerobot.policies.groot import processor_groot
+
+    try:
+        snapshot_download(processor_groot.GROOT_N1_7_BACKBONE_MODEL, local_files_only=True)
+    except OSError:
+        pytest.skip("the GR00T N1.7 backbone processor is not in the local Hugging Face cache")
+
+    attempts = []
+
+    def refuse(sock, address):
+        attempts.append(address)
+        raise OSError("network access refused by the test")
+
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    monkeypatch.setattr(socket.socket, "connect", refuse)
+
+    processor = processor_groot._build_n1_7_processor(processor_groot.GROOT_N1_7_BACKBONE_MODEL)
+
+    assert attempts == []
+    assert processor.tokenizer.padding_side == "left"
+
+
+def test_groot_rtc_inputs_keep_the_head_of_a_leftover_longer_than_the_model_horizon():
+    """Leftover row 0 is the action at this chunk's observation, so it must stay new row 0."""
+    policy = object.__new__(GrootPolicy)
+    policy.config = SimpleNamespace(
+        use_relative_actions=False,
+        chunk_size=8,
+        max_action_dim=132,
+        rtc_config=SimpleNamespace(execution_horizon=50),
+    )
+    policy._groot_model = SimpleNamespace(config=SimpleNamespace(action_horizon=4, max_action_dim=132))
+    prefix = torch.arange(6 * 6, dtype=torch.float32).view(6, 6) + 1.0
+
+    output_inputs, options = policy._prepare_n1_7_rtc_inputs(
+        {"state": torch.zeros(1, 1, 132)},
+        inference_delay=2,
+        prev_chunk_left_over=prefix,
+    )
+
+    assert options["action_horizon"] == 4
+    assert options["rtc_overlap_steps"] == 4
+    torch.testing.assert_close(output_inputs["action"][0, :, :6], prefix[:4])
 
 
 def test_groot_n1_7_saved_processors_reload_through_factory(tmp_path):

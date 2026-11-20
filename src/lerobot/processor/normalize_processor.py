@@ -36,6 +36,32 @@ from .converters import from_tensor_to_numpy, to_tensor
 from .pipeline import PolicyProcessorPipeline, ProcessorStep, ProcessorStepRegistry
 
 
+def validate_zero_indices(name: str, indices: Any, dim: int | None) -> None:
+    """Check a list of last-dim indices that a processor step zeroes.
+
+    Shared by `NormalizerProcessorStep.zero_features` and the GR00T pack step's
+    `state_zero_indices`.
+
+    Args:
+        name: The field name used in error messages.
+        indices: The indices to check.
+        dim: The size of the dimension they index, or `None` when it is not known yet.
+
+    Raises:
+        ValueError: If `indices` is not a non-empty list of unique integers in `[0, dim)`.
+    """
+    if not isinstance(indices, list | tuple) or not indices:
+        raise ValueError(f"{name} must be a non-empty list of indices, got {indices!r}.")
+    if any(isinstance(i, bool) or not isinstance(i, int) for i in indices):
+        raise ValueError(f"{name} must contain only integers, got {indices!r}.")
+    if len(set(indices)) != len(indices):
+        raise ValueError(f"{name} contains repeated indices: {indices!r}.")
+    if min(indices) < 0:
+        raise ValueError(f"{name} contains negative indices: {indices!r}.")
+    if dim is not None and max(indices) >= dim:
+        raise ValueError(f"{name} contains indices out of range for a dimension of size {dim}: {indices!r}.")
+
+
 @dataclass
 class _NormalizationMixin:
     """
@@ -433,7 +459,104 @@ class NormalizerProcessorStep(_NormalizationMixin, ProcessorStep):
     This class uses the logic from `_NormalizationMixin` to perform forward normalization
     (e.g., scaling data to have zero mean and unit variance, or to the range [-1, 1]).
     It is typically used in the pre-processing pipeline before feeding data to a policy.
+
+    Attributes:
+        zero_features: Observation dims to hide from the policy, as a map from an observation
+            key to indices into its last dimension. Right after normalization, on every call,
+            those dims are set to 0 in the normalized space: the mean under MEAN_STD, the
+            midpoint of the range under MIN_MAX / QUANTILES / QUANTILE10. The zeroing is out
+            of place, so tensors that earlier steps cached from the raw observation (e.g. the
+            anchor of `RelativeActionsProcessorStep`) stay untouched. Only keys that are
+            really normalized are accepted (see `validate_zero_features`), because for any
+            other key the normalizer hands back the raw tensor object itself. Steps that
+            anchor on the raw observation must run before this one, as the policy factories
+            order them. Serialized only when non-empty, so unmasked pipelines keep loading on
+            stock lerobot.
     """
+
+    zero_features: dict[str, list[int]] = field(default_factory=dict)
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.zero_features = dict(self.zero_features or {})
+        # Pipelines loaded with `from_pretrained` are constructed before `load_state_dict`
+        # fills the stats, so the stats check waits for the first call in that case.
+        self.validate_zero_features(require_stats=bool(self._tensor_stats))
+
+    def validate_zero_features(self, *, require_stats: bool = True) -> None:
+        """Check that every `zero_features` entry names a normalized observation dim.
+
+        Runs at construction and on every call, since assigning the attribute after
+        construction skips `__post_init__`. Callers that set `zero_features` on an existing
+        step can call it directly to fail early.
+
+        Args:
+            require_stats: Also require normalization stats for every masked key. Disable
+                only before stats are loaded.
+
+        Raises:
+            ValueError: If a key is not a non-visual observation feature of this normalizer,
+                is excluded by `normalize_observation_keys`, uses IDENTITY normalization or has
+                no stats, or if its indices are empty, not integers, repeated, negative or
+                not below the feature's last dimension.
+        """
+        for key, indices in self.zero_features.items():
+            feature = self.features.get(key)
+            if feature is None:
+                raise ValueError(
+                    f"zero_features key '{key}' is not a feature of this normalizer "
+                    f"(features: {sorted(self.features)})."
+                )
+            if feature.type == FeatureType.ACTION:
+                raise ValueError(
+                    f"zero_features key '{key}' is an action feature; only observations can be zeroed."
+                )
+            if feature.type == FeatureType.VISUAL:
+                raise ValueError(
+                    f"zero_features key '{key}' is a visual feature; its last dimension is image width, "
+                    "not a list of named dims."
+                )
+            if self.normalize_observation_keys is not None and key not in self.normalize_observation_keys:
+                raise ValueError(
+                    f"zero_features key '{key}' is excluded by normalize_observation_keys, so it is never "
+                    "normalized and cannot be zeroed in normalized space."
+                )
+            norm_mode = self.norm_map.get(feature.type, NormalizationMode.IDENTITY)
+            if norm_mode == NormalizationMode.IDENTITY:
+                raise ValueError(
+                    f"zero_features key '{key}' uses IDENTITY normalization ({feature.type.value}); zero has "
+                    "no meaning in raw units, so the mask requires a normalized feature."
+                )
+            if require_stats and key not in self._tensor_stats:
+                raise ValueError(
+                    f"zero_features key '{key}' has no normalization stats, so it is never normalized and "
+                    "cannot be zeroed in normalized space."
+                )
+            dim = feature.shape[-1] if feature.shape else None
+            validate_zero_indices(f"zero_features['{key}']", indices, dim)
+
+    def _zero_masked_features(self, normalized: dict[str, Any], raw: RobotObservation) -> dict[str, Any]:
+        for key, indices in self.zero_features.items():
+            if key not in normalized:
+                continue
+            value = normalized[key]
+            # Backstop only: `validate_zero_features` already refuses every key that the
+            # normalizer would return unchanged (a non-tensor input is always converted anew).
+            if value is raw.get(key):
+                raise RuntimeError(
+                    f"zero_features key '{key}' was not normalized (the normalizer returned the raw "
+                    "tensor); refusing to zero it in raw units."
+                )
+            validate_zero_indices(f"zero_features['{key}']", indices, value.shape[-1])
+            index = torch.as_tensor(indices, dtype=torch.long, device=value.device)
+            normalized[key] = value.index_fill(-1, index, 0)
+        return normalized
+
+    def get_config(self) -> dict[str, Any]:
+        config = super().get_config()
+        if self.zero_features:
+            config["zero_features"] = {key: list(idx) for key, idx in sorted(self.zero_features.items())}
+        return config
 
     @classmethod
     def from_lerobot_dataset(
@@ -471,13 +594,13 @@ class NormalizerProcessorStep(_NormalizationMixin, ProcessorStep):
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         new_transition = transition.copy()
+        self.validate_zero_features()
 
-        # Handle observation normalization.
+        # Handle observation normalization, then zero the masked dims in normalized space.
         observation = new_transition.get(TransitionKey.OBSERVATION)
         if observation is not None:
-            new_transition[TransitionKey.OBSERVATION] = self._normalize_observation(
-                observation, inverse=False
-            )
+            normalized = self._normalize_observation(observation, inverse=False)
+            new_transition[TransitionKey.OBSERVATION] = self._zero_masked_features(normalized, observation)
 
         # Handle action normalization.
         action = new_transition.get(TransitionKey.ACTION)
