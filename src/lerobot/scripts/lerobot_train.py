@@ -1121,7 +1121,7 @@ def train(cfg: TrainPipelineConfig) -> None:
             train_tracker.reset_averages()
 
         if is_eval_step:
-            eval_metrics, compute_action_rmse = run_validation(
+            validation_metrics, compute_action_rmse = run_validation(
                 policy,
                 accelerator,
                 eval_dataloader,
@@ -1131,10 +1131,12 @@ def train(cfg: TrainPipelineConfig) -> None:
                 compute_action_rmse,
             )
             if is_main_process():
-                logging.info(f"step {step}: " + " ".join(f"{k}={v:.4f}" for k, v in eval_metrics.items()))
+                logging.info(
+                    f"step {step}: " + " ".join(f"{k}={v:.4f}" for k, v in validation_metrics.items())
+                )
                 if wandb_logger:
                     # `eval/steps` is the x-axis for the eval charts, like `train/steps` for training.
-                    wandb_logger.log_dict({**eval_metrics, "steps": step}, step=step, mode="eval")
+                    wandb_logger.log_dict({**validation_metrics, "steps": step}, step=step, mode="eval")
 
         if cfg.save_checkpoint and is_saving_step:
             # Collective: every rank participates (gathers / DCP shard writes); rank-0-only file
