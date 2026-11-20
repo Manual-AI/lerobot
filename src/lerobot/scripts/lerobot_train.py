@@ -30,6 +30,7 @@ torchrun --nproc-per-node=8 $(which lerobot-train) \
 
 import dataclasses
 import logging
+import math
 import sys
 import time
 from collections.abc import Iterator
@@ -88,7 +89,7 @@ from lerobot.processor import ImageAugmentationProcessorStep
 from lerobot.processor.rename_processor import rename_batch_keys, rename_stats
 from lerobot.rewards import make_reward_pre_post_processors
 from lerobot.utils.collate import lerobot_collate_fn
-from lerobot.utils.constants import PRETRAINED_MODEL_DIR, TRAINING_STATE_DIR
+from lerobot.utils.constants import ACTION, PRETRAINED_MODEL_DIR, TRAINING_STATE_DIR
 from lerobot.utils.import_utils import (
     _accelerate_available,
     _peft_available,
@@ -184,6 +185,108 @@ def _make_image_augmentation(
         compile_model=image_transforms.gpu_compile,
         seed=None if cfg.seed is None else cfg.seed + process_index,
     )
+
+
+MIN_TRAIN_SAMPLES_FOR_EVAL = 5
+
+
+def resolve_eval_steps(cfg: TrainPipelineConfig, n_train_samples: int) -> tuple[int, bool]:
+    """Validation cadence as `(eval_steps, eval_on_checkpoint)`.
+
+    An explicit `cfg.eval_steps` is used as given (0 = disabled). With `None`, validation runs at
+    every checkpoint-saving step, and is disabled when there are fewer than
+    `MIN_TRAIN_SAMPLES_FOR_EVAL` training samples.
+    """
+    if cfg.eval_steps is not None:
+        return cfg.eval_steps, False
+    if n_train_samples < MIN_TRAIN_SAMPLES_FOR_EVAL:
+        logging.warning(
+            f"Validation disabled: only {n_train_samples} training samples (< {MIN_TRAIN_SAMPLES_FOR_EVAL})."
+        )
+        return 0, False
+    return 0, True
+
+
+def _action_error_terms(pred: torch.Tensor, batch: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sum of squared errors and element count between a predicted chunk and the ground truth.
+
+    Only the real action dimensions and the non-padded chunk steps count. Policies pad one side to a
+    fixed width (GR00T pads the preprocessed ground truth to ``max_action_dim`` and slices its
+    prediction back to the real width; others pad the prediction), so the real width is the smaller
+    of the two.
+    """
+    gt = batch[ACTION]
+    if gt.ndim == 2:
+        gt = gt.unsqueeze(1)
+    if pred.ndim == 2:
+        pred = pred.unsqueeze(1)
+    n_steps = min(gt.shape[1], pred.shape[1])
+    action_dim = min(gt.shape[-1], pred.shape[-1])
+    gt = gt[:, :n_steps, :action_dim].float()
+    pred = pred[:, :n_steps, :action_dim].float()
+    valid = torch.ones(gt.shape[:2], dtype=torch.bool, device=gt.device)
+    is_pad = batch.get(f"{ACTION}_is_pad")
+    if is_pad is not None:
+        valid = ~is_pad[:, :n_steps].to(gt.device)
+    sq = ((pred - gt) ** 2).sum(dim=-1)
+    count = valid.sum() * action_dim
+    return (sq * valid).sum().double(), count.double()
+
+
+def run_validation(
+    policy: Any,
+    accelerator: Any,
+    eval_dataloader: Any,
+    cfg: TrainPipelineConfig,
+    camera_keys: list[str],
+    preprocessor: Any,
+    compute_action_rmse: bool,
+) -> tuple[dict[str, float], bool]:
+    """One validation pass over the held-out data: eval_loss and (optionally) eval_action_rmse.
+
+    Returns the metrics and whether the action RMSE is still supported by the policy.
+    """
+    device = accelerator.device
+    policy.eval()
+    loss_sum, n_batches = 0.0, 0
+    sq_sum = torch.zeros((), dtype=torch.float64, device=device)
+    n_elems = torch.zeros((), dtype=torch.float64, device=device)
+    with torch.no_grad(), accelerator.autocast():
+        # Nested under the training bar (position=1) and cleared when the pass ends.
+        eval_progbar = tqdm(
+            eval_dataloader,
+            desc="Validation",
+            unit="batch",
+            disable=inside_slurm() or not accelerator.is_main_process,
+            position=1,
+            leave=False,
+        )
+        for eval_batch in eval_progbar:
+            eval_batch = _preprocess_dataset_batch(eval_batch, camera_keys, cfg.rename_map, preprocessor)
+            loss, _ = policy(eval_batch)  # __call__, so FSDP2 forward hooks run
+            loss_sum += loss.item()
+            n_batches += 1
+            if compute_action_rmse:
+                try:
+                    pred = accelerator.unwrap_model(policy).predict_action_chunk(eval_batch)
+                except NotImplementedError:
+                    logging.warning("Policy has no predict_action_chunk; eval_action_rmse is disabled.")
+                    compute_action_rmse = False
+                    continue
+                batch_sq, batch_n = _action_error_terms(pred, eval_batch)
+                sq_sum += batch_sq
+                n_elems += batch_n
+    policy.train()
+
+    metrics = {
+        "eval_loss": accelerator.reduce(
+            torch.tensor(loss_sum / max(n_batches, 1), device=device), reduction="mean"
+        ).item()
+    }
+    if compute_action_rmse:
+        totals = accelerator.reduce(torch.stack([sq_sum, n_elems]), reduction="sum")
+        metrics["eval_action_rmse"] = math.sqrt(totals[0].item() / max(totals[1].item(), 1.0))
+    return metrics, compute_action_rmse
 
 
 def _preprocess_dataset_batch(
@@ -527,6 +630,12 @@ def make_dataloaders(
                 selected.extend(frames.tolist())
             eval_ds = torch.utils.data.Subset(eval_ds, selected)
 
+        if cfg.max_eval_batches > 0:
+            max_frames = cfg.max_eval_batches * cfg.batch_size
+            if len(eval_ds) > max_frames:
+                strided = torch.linspace(0, len(eval_ds) - 1, max_frames).long().tolist()
+                eval_ds = torch.utils.data.Subset(eval_ds, strided)
+
         eval_collate_fn = lerobot_collate_fn if dataset.meta.has_language_columns else None
         eval_dataloader = torch.utils.data.DataLoader(
             eval_ds,
@@ -779,6 +888,16 @@ def train(cfg: TrainPipelineConfig) -> None:
             policy, optimizer, dataloader, lr_scheduler
         )
     finalize_sharded_policy(policy, parallel_dims)
+    eval_steps, eval_on_checkpoint = 0, False
+    compute_action_rmse = False
+    if eval_dataloader is not None:
+        eval_steps, eval_on_checkpoint = resolve_eval_steps(cfg, len(dataset))
+        # predict_action_chunk bypasses the FSDP2 forward hooks, so skip it for sharded runs;
+        # reward models have no action output.
+        compute_action_rmse = not parallel_dims.is_sharded and not cfg.is_reward_model_training
+        if is_main_process() and (eval_steps > 0 or eval_on_checkpoint):
+            cadence = "at every checkpoint" if eval_on_checkpoint else f"every {eval_steps} steps"
+            logging.info(f"Validation {cadence} (eval_action_rmse={compute_action_rmse})")
     if cfg.resume:
         resume_after_prepare(cfg, accelerator, policy, optimizer, lr_scheduler)
 
@@ -975,7 +1094,9 @@ def train(cfg: TrainPipelineConfig) -> None:
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0
         is_saving_step = should_save_checkpoint(step, cfg.save_freq, cfg.steps)
         is_env_eval_step = cfg.env_eval_freq > 0 and step % cfg.env_eval_freq == 0
-        is_eval_step = cfg.eval_steps > 0 and step % cfg.eval_steps == 0
+        is_eval_step = eval_dataloader is not None and (
+            (eval_steps > 0 and step % eval_steps == 0) or (eval_on_checkpoint and is_saving_step)
+        )
 
         if is_log_step:
             # Collective reduce must run on every rank, before the main-process gate below.
@@ -999,27 +1120,21 @@ def train(cfg: TrainPipelineConfig) -> None:
                     wandb_logger.log_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
 
-        if is_eval_step and eval_dataloader is not None:
-            policy.eval()
-            eval_loss_sum = 0.0
-            n_eval_batches = 0
-            with torch.no_grad(), accelerator.autocast():
-                for eval_batch in eval_dataloader:
-                    eval_batch = _preprocess_dataset_batch(
-                        eval_batch, dataset.meta.camera_keys, cfg.rename_map, preprocessor
-                    )
-                    loss, _ = policy(eval_batch)  # __call__, so FSDP2 forward hooks run
-                    eval_loss_sum += loss.item()
-                    n_eval_batches += 1
-            eval_loss = eval_loss_sum / max(n_eval_batches, 1)
-            eval_loss = torch.tensor(eval_loss, device=device)
-            eval_loss = accelerator.reduce(eval_loss, reduction="mean").item()
-            policy.train()
-
+        if is_eval_step:
+            eval_metrics, compute_action_rmse = run_validation(
+                policy,
+                accelerator,
+                eval_dataloader,
+                cfg,
+                dataset.meta.camera_keys,
+                preprocessor,
+                compute_action_rmse,
+            )
             if is_main_process():
-                logging.info(f"step {step}: eval_loss={eval_loss:.4f}")
+                logging.info(f"step {step}: " + " ".join(f"{k}={v:.4f}" for k, v in eval_metrics.items()))
                 if wandb_logger:
-                    wandb_logger.log_dict({"eval_loss": eval_loss}, step=step, mode="eval")
+                    # `eval/steps` is the x-axis for the eval charts, like `train/steps` for training.
+                    wandb_logger.log_dict({**eval_metrics, "steps": step}, step=step, mode="eval")
 
         if cfg.save_checkpoint and is_saving_step:
             # Collective: every rank participates (gathers / DCP shard writes); rank-0-only file

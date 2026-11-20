@@ -26,6 +26,21 @@ from .video import DEFAULT_DEPTH_UNIT, DEPTH_METER_UNIT, DEPTH_MILLIMETER_UNIT
 logger = logging.getLogger(__name__)
 
 
+DEFAULT_EVAL_SPLIT = 0.2
+EVAL_SPLIT_MODES = ("last", "random")
+
+
+@dataclass
+class ResolvedSplit:
+    """The train/held-out episode split a run actually used."""
+
+    mode: str
+    eval_split: float
+    seed: int
+    train_episodes: list[int] = field(default_factory=list)
+    eval_episodes: list[int] = field(default_factory=list)
+
+
 @dataclass
 class DatasetConfig:
     # You may provide a list of datasets here. `train.py` creates them all and concatenates them. Note: only data
@@ -76,15 +91,29 @@ class DatasetConfig:
     # Maximum open video decoders. Streaming: per rank, None covers every camera in the episode pool.
     # Map-style: only for non-default storage formats (e.g. lance), per DataLoader worker.
     video_decoder_cache_size: int | None = None
-    # Fraction of episodes held out per task for offline evaluation (0.0 = disabled).
-    eval_split: float = 0.0
+    # Fraction of episodes held out per task for offline validation. `None` (the default) resolves
+    # to 0.2 for map-style datasets and 0.0 for streaming ones; set 0.0 to train on all episodes
+    # (this also disables the validation pass and its metrics).
+    eval_split: float | None = None
+    # How held-out episodes are chosen per task: "last" holds out the final episodes (deterministic),
+    # "random" draws them with a generator seeded from the training seed.
+    eval_split_mode: str = "last"
+    # The split actually used by the run. Filled in by the training script and saved with every
+    # checkpoint's train_config.json; on resume the recomputed split must match it.
+    resolved_split: ResolvedSplit | None = None
 
     def __post_init__(self) -> None:
         if self.repo_type not in ("dataset", "bucket"):
             raise ValueError(f"repo_type must be 'dataset' or 'bucket', got {self.repo_type!r}")
+        if self.eval_split is None:
+            self.eval_split = 0.0 if self.streaming else DEFAULT_EVAL_SPLIT
         if self.eval_split != 0.0 and self.streaming:
             raise ValueError(
                 "eval_split requires map-style datasets and is not supported with dataset.streaming=true."
+            )
+        if self.eval_split_mode not in EVAL_SPLIT_MODES:
+            raise ValueError(
+                f"eval_split_mode must be one of {EVAL_SPLIT_MODES}, got {self.eval_split_mode!r}"
             )
         if self.depth_output_unit not in (DEPTH_METER_UNIT, DEPTH_MILLIMETER_UNIT):
             raise ValueError(

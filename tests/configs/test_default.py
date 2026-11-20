@@ -108,3 +108,11 @@ def test_dataset_config_eval_split():
     DatasetConfig(repo_id="user/repo", repo_type="bucket", eval_split=0.1)
     with pytest.raises(ValueError, match="streaming"):
         DatasetConfig(repo_id="user/repo", streaming=True, eval_split=0.1)
+
+
+def test_dataset_config_eval_split_defaults():
+    assert DatasetConfig(repo_id="user/repo").eval_split == 0.2
+    assert DatasetConfig(repo_id="user/repo", streaming=True).eval_split == 0.0
+    assert DatasetConfig(repo_id="user/repo", eval_split=0.0).eval_split == 0.0
+    with pytest.raises(ValueError, match="eval_split_mode"):
+        DatasetConfig(repo_id="user/repo", eval_split_mode="shuffle")
