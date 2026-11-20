@@ -56,6 +56,7 @@ from lerobot.common.train_utils import (
     resume_after_prepare,
     resume_before_prepare,
     save_checkpoint,
+    save_initial_checkpoint,
     should_save_checkpoint,
     update_last_checkpoint,
 )
@@ -900,6 +901,10 @@ def train(cfg: TrainPipelineConfig) -> None:
             logging.info(f"Validation {cadence} (eval_action_rmse={compute_action_rmse})")
     if cfg.resume:
         resume_after_prepare(cfg, accelerator, policy, optimizer, lr_scheduler)
+
+    save_initial_checkpoint(
+        cfg, policy, optimizer, lr_scheduler, preprocessor, postprocessor, accelerator, step
+    )
 
     # --- auxiliaries (after the core assembly, per the construction-order contract) -------------
     sample_weighter = None
